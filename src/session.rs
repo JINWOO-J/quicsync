@@ -1,0 +1,235 @@
+// 전체 세션 생명주기 관리 및 시그널 핸들링
+
+use std::net::SocketAddr;
+
+use tokio::sync::watch;
+
+use crate::buffer::BufferLayer;
+use crate::error::SessionError;
+use crate::quic::{QuicClientCfg, QuicTunnel};
+use crate::rsync::RsyncChild;
+use crate::ssh::launch_remote_server;
+use crate::tcp_proxy::TcpProxy;
+use crate::types::CliArgs;
+
+/// 세션: SSH → QUIC → TCP_Proxy → rsync 전체 파이프라인을 관리한다.
+pub struct Session {
+    ssh_process: tokio::process::Child,
+    tunnel: QuicTunnel,
+    rsync: RsyncChild,
+}
+
+impl Session {
+    /// 모든 컴포넌트를 순서대로 초기화하고 연결한다.
+    ///
+    /// 1. SSH로 원격 quicsync server 실행 (포트+토큰 수신)
+    /// 2. QUIC 터널 수립
+    /// 3. 양방향 QUIC 스트림 열기 + 인증 토큰/rsync args 전송
+    /// 4. 로컬 TCP 프록시 바인딩
+    /// 5. rsync 자식 프로세스 실행
+    /// 6. Buffer relay 태스크 spawn
+    pub async fn start(args: CliArgs) -> Result<Self, SessionError> {
+        // 1. SSH로 원격 서버 실행
+        tracing::info!("launching remote server via SSH...");
+        let handshake = launch_remote_server(&args.remote)
+            .await
+            .map_err(|e| SessionError::InitFailed(format!("SSH: {e}")))?;
+
+        let ssh_process = handshake.ssh_process;
+        let remote_addr: SocketAddr = format!("{}:{}", args.remote.host, handshake.remote_port)
+            .parse()
+            .map_err(|e| SessionError::InitFailed(format!("invalid remote addr: {e}")))?;
+
+        // 2. QUIC 터널 수립
+        tracing::info!("connecting QUIC tunnel to {}...", remote_addr);
+        let tunnel = QuicTunnel::connect(QuicClientCfg {
+            remote_addr,
+            auth_token: handshake.auth_token.clone(),
+            server_name: "localhost".to_string(),
+        })
+        .await
+        .map_err(|e| SessionError::InitFailed(format!("QUIC: {e}")))?;
+
+        // 3. 양방향 스트림 열기
+        let (mut send_stream, recv_stream) = tunnel
+            .open_bi_stream()
+            .await
+            .map_err(|e| SessionError::InitFailed(format!("QUIC stream: {e}")))?;
+
+        // 인증 토큰을 첫 번째 메시지로 전송
+        send_stream
+            .write_all(format!("{}\n", handshake.auth_token).as_bytes())
+            .await
+            .map_err(|e| SessionError::InitFailed(format!("send token: {e}")))?;
+
+        // rsync args 라인 전송 (원격 서버가 rsync 프로세스를 spawn할 때 사용)
+        let rsync_args_line = build_remote_rsync_args(&args);
+        send_stream
+            .write_all(format!("{}\n", rsync_args_line).as_bytes())
+            .await
+            .map_err(|e| SessionError::InitFailed(format!("send args: {e}")))?;
+
+        // 4. TCP 프록시 바인딩
+        let proxy = TcpProxy::bind()
+            .await
+            .map_err(|e| SessionError::InitFailed(format!("TCP proxy: {e}")))?;
+        let proxy_port = proxy.port();
+        tracing::info!("TCP proxy listening on 127.0.0.1:{}", proxy_port);
+
+        // 5. rsync 자식 프로세스 실행
+        let rsync = RsyncChild::spawn(
+            &args.rsync_options,
+            &args.local_path,
+            &args.remote,
+            proxy_port,
+            args.direction,
+        )
+        .map_err(|e| SessionError::InitFailed(format!("rsync: {e}")))?;
+
+        // 6. Buffer relay 태스크 spawn
+        let buffer = BufferLayer::from_env();
+        let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel(256);
+        let (rev_tx, rev_rx) = tokio::sync::mpsc::channel(256);
+
+        // TCP_Proxy relay: rsync TCP ↔ 채널
+        tokio::spawn(async move {
+            if let Err(e) = proxy.relay(fwd_tx, rev_rx).await {
+                tracing::error!("TCP proxy relay error: {e}");
+            }
+        });
+
+        // Buffer forward relay: 채널 → QUIC SendStream
+        tokio::spawn(async move {
+            if let Err(e) = buffer.relay_forward(fwd_rx, send_stream).await {
+                tracing::error!("forward relay error: {e}");
+            }
+        });
+
+        // Buffer reverse relay: QUIC RecvStream → 채널
+        let reverse_buffer = BufferLayer::from_env();
+        tokio::spawn(async move {
+            if let Err(e) = reverse_buffer.relay_reverse(recv_stream, rev_tx).await {
+                tracing::error!("reverse relay error: {e}");
+            }
+        });
+
+        tracing::info!("session started, waiting for rsync to complete...");
+
+        Ok(Self {
+            ssh_process,
+            tunnel,
+            rsync,
+        })
+    }
+
+    /// 세션 실행: rsync 완료 또는 시그널 수신까지 대기한다.
+    ///
+    /// - rsync 정상 완료 → shutdown → 종료 코드 반환
+    /// - SIGINT/SIGTERM → abort → 종료 코드 반환
+    pub async fn run(self) -> Result<i32, SessionError> {
+        let mut signal_rx = install_signal_handlers()?;
+
+        let Session { mut ssh_process, tunnel, rsync } = self;
+
+        tokio::select! {
+            result = rsync.wait() => {
+                let code = match result {
+                    Ok(code) => {
+                        tracing::info!("rsync completed with exit code {code}");
+                        code
+                    }
+                    Err(crate::error::RsyncError::ExitCode(code)) => {
+                        tracing::warn!("rsync exited with code {code}");
+                        code
+                    }
+                    Err(e) => {
+                        tracing::error!("rsync error: {e}");
+                        1
+                    }
+                };
+                shutdown(tunnel, &mut ssh_process).await;
+                Ok(code)
+            }
+            _ = signal_rx.changed() => {
+                tracing::warn!("signal received, aborting session...");
+                abort(tunnel, &mut ssh_process).await;
+                Ok(130) // SIGINT → 128+2=130
+            }
+        }
+    }
+}
+
+/// 정상 종료: QUIC 터널 → SSH 프로세스 순서로 정리한다. (Req 8.1)
+async fn shutdown(tunnel: QuicTunnel, ssh_process: &mut tokio::process::Child) {
+    tracing::info!("shutting down session...");
+
+    if let Err(e) = tunnel.close().await {
+        tracing::warn!("QUIC close error: {e}");
+    }
+    let _ = ssh_process.kill().await;
+
+    tracing::info!("session shutdown complete");
+}
+
+/// 비정상 종료: QUIC close → SSH kill 순서로 정리한다. (Req 8.2, 8.3)
+/// rsync는 select!에서 아직 실행 중이므로 drop 시 자동 정리된다.
+async fn abort(tunnel: QuicTunnel, ssh_process: &mut tokio::process::Child) {
+    tracing::warn!("aborting session...");
+
+    if let Err(e) = tunnel.close().await {
+        tracing::warn!("QUIC close error during abort: {e}");
+    }
+    let _ = ssh_process.kill().await;
+
+    tracing::info!("session abort complete");
+}
+/// SIGINT/SIGTERM 시그널 핸들러를 등록한다.
+/// 시그널 수신 시 watch 채널을 통해 true를 전파한다.
+pub fn install_signal_handlers() -> Result<watch::Receiver<bool>, SessionError> {
+    let (tx, rx) = watch::channel(false);
+
+    tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate())
+                .expect("failed to register SIGTERM handler");
+
+            tokio::select! {
+                _ = ctrl_c => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = ctrl_c.await;
+        }
+
+        let _ = tx.send(true);
+    });
+
+    Ok(rx)
+}
+
+/// 원격 서버에 전달할 rsync args 라인을 구성한다.
+/// 원격 서버는 이 인수로 rsync --server 프로세스를 실행한다.
+fn build_remote_rsync_args(args: &CliArgs) -> String {
+    let mut remote_args = vec!["--server".to_string()];
+
+    // Push일 때 원격은 receiver, Pull일 때 원격은 sender
+    if matches!(args.direction, crate::types::TransferDirection::Pull) {
+        remote_args.push("--sender".to_string());
+    }
+
+    // rsync 옵션 전달
+    remote_args.extend(args.rsync_options.iter().cloned());
+
+    // 원격 경로
+    remote_args.push(".".to_string());
+    remote_args.push(args.remote.path.clone());
+
+    remote_args.join(" ")
+}
