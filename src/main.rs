@@ -8,18 +8,22 @@ use quicsync::session::Session;
 async fn main() -> ExitCode {
     let raw_args: Vec<String> = std::env::args().collect();
 
-    // --server / --connect 플래그는 parse_args 전에 감지한다.
+    // --connect를 먼저 확인한다.
+    // rsync가 rsh로 호출할 때 "rsync --server ..." 인수가 뒤에 붙으므로,
+    // --server보다 --connect를 먼저 검사해야 한다.
+    if let Some(port) = parse_connect_flag(&raw_args) {
+        return run_connect(port, &raw_args).await;
+    }
+
     if raw_args.iter().any(|a| a == "--server") {
         init_tracing(0); // 서버 모드는 warn 레벨
         return run_server().await;
     }
 
-    if let Some(port) = parse_connect_flag(&raw_args) {
-        return run_connect(port, &raw_args).await;
-    }
-
     let verbosity = count_verbose_flags(&raw_args);
     init_tracing(verbosity);
+
+    tracing::debug!("quicsync v{}", env!("CARGO_PKG_VERSION"));
 
     run_client(&raw_args).await
 }
@@ -75,10 +79,19 @@ async fn run_connect(port: u16, raw_args: &[String]) -> ExitCode {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 
-    let (r1, r2) = tokio::join!(
-        tokio::io::copy(&mut stdin, &mut tcp_write),
-        tokio::io::copy(&mut tcp_read, &mut stdout),
-    );
+    // stdin → tcp: rsync가 보내는 데이터를 TCP 프록시로 전달
+    // rsync가 전송 완료 후 stdin을 닫으면 tcp_write도 shutdown하여
+    // 서버에 EOF를 전파한다.
+    let fwd = async {
+        let r = tokio::io::copy(&mut stdin, &mut tcp_write).await;
+        let _ = tcp_write.shutdown().await;
+        r
+    };
+
+    // tcp → stdout: 서버에서 오는 데이터를 rsync에 전달
+    let rev = tokio::io::copy(&mut tcp_read, &mut stdout);
+
+    let (r1, r2) = tokio::join!(fwd, rev);
 
     if r1.is_err() && r2.is_err() {
         ExitCode::FAILURE

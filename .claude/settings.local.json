@@ -2,7 +2,14 @@
   "permissions": {
     "allow": [
       "Bash(cargo build:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(head:*)",
+      "Bash(quicsync:*)",
+      "Bash(timeout 20 quicsync:*)",
+      "Bash(echo EXIT CODE: $?:*)",
+      "Bash(rm:*)",
+      "Bash(echo cross not found:*)",
+      "Bash(make deploy:*)"
     ]
   }
 }
