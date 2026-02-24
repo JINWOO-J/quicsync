@@ -27,8 +27,7 @@ pub async fn launch_remote_server(
 
     let mut child = Command::new("ssh")
         .arg(&ssh_target)
-        .arg("quicsync")
-        .arg("--server")
+        .arg("PATH=$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH quicsync --server")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
