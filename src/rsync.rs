@@ -189,7 +189,7 @@ mod tests {
 
             // (2) --rsh 옵션이 사용자 옵션 바로 뒤에 위치하며 올바른 포트 포함
             let rsh = &args[n];
-            let expected_rsh = format!("--rsh=nc localhost {}", port);
+            let expected_rsh = format!("--rsh=sh -c 'exec nc localhost {}'", port);
             prop_assert_eq!(rsh, &expected_rsh);
 
             // (3) remote spec 포맷 검증
