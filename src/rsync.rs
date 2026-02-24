@@ -37,8 +37,9 @@ pub fn build_rsync_args(
 
     // --rsh 옵션으로 TCP_Proxy 포트를 통해 연결하도록 리다이렉션 (Req 7.1)
     // rsync는 --rsh 프로그램을 `PROGRAM host rsync --server ...` 형태로 호출한다.
-    // 추가 인수를 무시하고 nc로 localhost:proxy_port에만 연결하는 shell wrapper를 사용한다.
-    args.push(format!("--rsh=sh -c 'exec nc localhost {}'", proxy_port));
+    // quicsync --connect 모드가 localhost:proxy_port에 TCP 연결 후 stdin/stdout relay를 수행한다.
+    // rsync가 추가하는 인수(host, --server 등)는 자동으로 무시된다.
+    args.push(format!("--rsh=quicsync --connect {}", proxy_port));
 
     let remote_spec = format_remote_spec(remote);
     let local = local_path.to_string_lossy().to_string();
@@ -189,7 +190,7 @@ mod tests {
 
             // (2) --rsh 옵션이 사용자 옵션 바로 뒤에 위치하며 올바른 포트 포함
             let rsh = &args[n];
-            let expected_rsh = format!("--rsh=sh -c 'exec nc localhost {}'", port);
+            let expected_rsh = format!("--rsh=quicsync --connect {}", port);
             prop_assert_eq!(rsh, &expected_rsh);
 
             // (3) remote spec 포맷 검증
@@ -234,7 +235,7 @@ mod tests {
 
         assert_eq!(args[0], "-avz");
         assert_eq!(args[1], "--delete");
-        assert_eq!(args[2], "--rsh=sh -c 'exec nc localhost 12345'");
+        assert_eq!(args[2], "--rsh=quicsync --connect 12345");
         assert_eq!(args[3], "/local/src");
         assert_eq!(args[4], "deploy@server.example.com:/data/backup");
     }
@@ -255,7 +256,7 @@ mod tests {
         );
 
         assert_eq!(args[0], "-r");
-        assert_eq!(args[1], "--rsh=sh -c 'exec nc localhost 54321'");
+        assert_eq!(args[1], "--rsh=quicsync --connect 54321");
         // Pull: remote first, then local
         assert_eq!(args[2], "10.0.0.1:/remote/files");
         assert_eq!(args[3], "/local/dest");
@@ -276,7 +277,7 @@ mod tests {
             TransferDirection::Push,
         );
 
-        assert_eq!(args[0], "--rsh=sh -c 'exec nc localhost 8080'");
+        assert_eq!(args[0], "--rsh=quicsync --connect 8080");
         assert_eq!(args[1], "/local");
         assert_eq!(args[2], "host:/path");
         assert_eq!(args.len(), 3);
@@ -309,7 +310,7 @@ mod tests {
             assert_eq!(&args[i], opt);
         }
         // --rsh 옵션이 사용자 옵션 뒤에 위치
-        assert_eq!(args[options.len()], "--rsh=sh -c 'exec nc localhost 9999'");
+        assert_eq!(args[options.len()], "--rsh=quicsync --connect 9999");
     }
 
     #[test]

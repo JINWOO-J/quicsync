@@ -60,17 +60,11 @@ impl Session {
             .map_err(|e| SessionError::InitFailed(format!("QUIC stream: {e}")))?;
 
         // 인증 토큰을 첫 번째 메시지로 전송
+        // rsync 서버 인수는 --connect 모드가 rsh 호출에서 추출하여 TCP 프록시를 통해 전송한다.
         send_stream
             .write_all(format!("{}\n", handshake.auth_token).as_bytes())
             .await
             .map_err(|e| SessionError::InitFailed(format!("send token: {e}")))?;
-
-        // rsync args 라인 전송 (원격 서버가 rsync 프로세스를 spawn할 때 사용)
-        let rsync_args_line = build_remote_rsync_args(&args);
-        send_stream
-            .write_all(format!("{}\n", rsync_args_line).as_bytes())
-            .await
-            .map_err(|e| SessionError::InitFailed(format!("send args: {e}")))?;
 
         // 4. TCP 프록시 바인딩
         let proxy = TcpProxy::bind()
@@ -217,22 +211,3 @@ pub fn install_signal_handlers() -> Result<watch::Receiver<bool>, SessionError> 
     Ok(rx)
 }
 
-/// 원격 서버에 전달할 rsync args 라인을 구성한다.
-/// 원격 서버는 이 인수로 rsync --server 프로세스를 실행한다.
-fn build_remote_rsync_args(args: &CliArgs) -> String {
-    let mut remote_args = vec!["--server".to_string()];
-
-    // Push일 때 원격은 receiver, Pull일 때 원격은 sender
-    if matches!(args.direction, crate::types::TransferDirection::Pull) {
-        remote_args.push("--sender".to_string());
-    }
-
-    // rsync 옵션 전달
-    remote_args.extend(args.rsync_options.iter().cloned());
-
-    // 원격 경로
-    remote_args.push(".".to_string());
-    remote_args.push(args.remote.path.clone());
-
-    remote_args.join(" ")
-}

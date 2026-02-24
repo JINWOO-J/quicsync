@@ -160,18 +160,14 @@ impl RemoteServer {
             Ok::<_, std::io::Error>(())
         };
 
-        // 양방향 동시 실행 — 어느 한쪽이 끝나면 다른 쪽도 종료
-        tokio::select! {
-            result = quic_to_rsync => {
-                if let Err(e) = result {
-                    eprintln!("[quicsync-server] quic→rsync relay error: {e}");
-                }
-            }
-            result = rsync_to_quic => {
-                if let Err(e) = result {
-                    eprintln!("[quicsync-server] rsync→quic relay error: {e}");
-                }
-            }
+        // 양방향 동시 실행 — 양쪽 모두 완료될 때까지 대기
+        // rsync 프로토콜은 양방향 비대칭이므로 한쪽이 먼저 끝나도 다른 쪽은 계속 진행해야 한다.
+        let (r1, r2) = tokio::join!(quic_to_rsync, rsync_to_quic);
+        if let Err(e) = r1 {
+            eprintln!("[quicsync-server] quic→rsync relay error: {e}");
+        }
+        if let Err(e) = r2 {
+            eprintln!("[quicsync-server] rsync→quic relay error: {e}");
         }
 
         // 7. rsync 종료 대기 및 종료 코드 반환

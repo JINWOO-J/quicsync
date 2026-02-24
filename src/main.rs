@@ -8,10 +8,14 @@ use quicsync::session::Session;
 async fn main() -> ExitCode {
     let raw_args: Vec<String> = std::env::args().collect();
 
-    // --server 플래그는 parse_args 전에 감지한다.
+    // --server / --connect 플래그는 parse_args 전에 감지한다.
     if raw_args.iter().any(|a| a == "--server") {
         init_tracing(0); // 서버 모드는 warn 레벨
         return run_server().await;
+    }
+
+    if let Some(port) = parse_connect_flag(&raw_args) {
+        return run_connect(port, &raw_args).await;
     }
 
     let verbosity = count_verbose_flags(&raw_args);
@@ -27,6 +31,87 @@ fn count_verbose_flags(args: &[String]) -> usize {
         .filter(|a| a.starts_with('-') && !a.starts_with("--") && !a.contains('='))
         .map(|a| a.chars().filter(|&c| c == 'v').count())
         .sum()
+}
+/// --connect PORT 플래그를 파싱한다. rsync의 --rsh에서 호출될 때 사용.
+fn parse_connect_flag(args: &[String]) -> Option<u16> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--connect" {
+            return iter.next().and_then(|p| p.parse().ok());
+        }
+    }
+    None
+}
+
+/// --connect 모드: rsync의 --rsh 트랜스포트로 동작한다.
+/// localhost:PORT에 TCP 연결 후, rsync 서버 인수를 전송하고 stdin/stdout ↔ TCP 양방향 relay.
+///
+/// rsync는 rsh 프로그램을 다음과 같이 호출한다:
+///   quicsync --connect PORT [-l user] host rsync --server [flags] . path
+/// "rsync" 이후의 인수를 원격 서버에 전달하여 올바른 프로토콜 협상이 이루어지도록 한다.
+async fn run_connect(port: u16, raw_args: &[String]) -> ExitCode {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    let rsync_server_args = extract_rsync_server_args(raw_args);
+
+    let stream = match TcpStream::connect(("127.0.0.1", port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("quicsync --connect: failed to connect to port {port}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (mut tcp_read, mut tcp_write) = stream.into_split();
+
+    // rsync 서버 인수를 TCP 프록시를 통해 원격 서버로 전송
+    let args_line = format!("{rsync_server_args}\n");
+    if let Err(e) = tcp_write.write_all(args_line.as_bytes()).await {
+        eprintln!("quicsync --connect: failed to send rsync args: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+
+    let (r1, r2) = tokio::join!(
+        tokio::io::copy(&mut stdin, &mut tcp_write),
+        tokio::io::copy(&mut tcp_read, &mut stdout),
+    );
+
+    if r1.is_err() && r2.is_err() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// rsync --rsh 인수에서 rsync 서버 명령 부분을 추출한다.
+///
+/// rsync는 rsh 프로그램을 다음과 같이 호출한다:
+///   PROGRAM --connect PORT [-l user] host rsync --server [flags] . path
+///
+/// "rsync" 인수를 찾아 그 이후의 모든 인수(`--server [flags] . path`)를 반환한다.
+fn extract_rsync_server_args(raw_args: &[String]) -> String {
+    // --connect PORT 이후의 인수를 수집
+    let mut iter = raw_args.iter().skip(1); // 프로그램 이름 건너뜀
+    let mut after_connect = Vec::new();
+    while let Some(arg) = iter.next() {
+        if arg == "--connect" {
+            iter.next(); // PORT 건너뜀
+            // 나머지 인수를 모두 수집
+            after_connect = iter.map(|s| s.as_str()).collect();
+            break;
+        }
+    }
+
+    // "rsync" 인수를 찾아 그 다음부터의 모든 인수를 반환
+    if let Some(pos) = after_connect.iter().position(|&a| a == "rsync") {
+        after_connect[pos + 1..].join(" ")
+    } else {
+        String::new()
+    }
 }
 
 /// verbosity 레벨에 따라 tracing을 초기화한다.
@@ -101,5 +186,67 @@ fn exit_code(code: i32) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(code as u8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn extract_rsync_server_args_typical_push() {
+        // rsync이 push 시 rsh에 전달하는 전형적인 인수
+        let args = s(&[
+            "quicsync", "--connect", "54220", "-l", "root", "jwserver68",
+            "rsync", "--server", "-vvve.LsfxCIvu", ".", "/app/upload-test",
+        ]);
+        assert_eq!(
+            extract_rsync_server_args(&args),
+            "--server -vvve.LsfxCIvu . /app/upload-test"
+        );
+    }
+
+    #[test]
+    fn extract_rsync_server_args_no_login_flag() {
+        // user 없이 호출되는 경우 (-l 플래그 없음)
+        let args = s(&[
+            "quicsync", "--connect", "12345", "myhost",
+            "rsync", "--server", "-e.LsfxC", ".", "/data",
+        ]);
+        assert_eq!(
+            extract_rsync_server_args(&args),
+            "--server -e.LsfxC . /data"
+        );
+    }
+
+    #[test]
+    fn extract_rsync_server_args_pull_with_sender() {
+        // pull 시 rsync가 --sender 플래그를 추가
+        let args = s(&[
+            "quicsync", "--connect", "8080", "-l", "user", "host",
+            "rsync", "--server", "--sender", "-vvve.LsfxCIvu", ".", "/remote/path",
+        ]);
+        assert_eq!(
+            extract_rsync_server_args(&args),
+            "--server --sender -vvve.LsfxCIvu . /remote/path"
+        );
+    }
+
+    #[test]
+    fn extract_rsync_server_args_no_rsync_found() {
+        // rsync 인수가 없는 비정상 케이스 → 빈 문자열 반환
+        let args = s(&["quicsync", "--connect", "54220", "-l", "root", "host"]);
+        assert_eq!(extract_rsync_server_args(&args), "");
+    }
+
+    #[test]
+    fn extract_rsync_server_args_no_connect_flag() {
+        // --connect 없는 경우 → 빈 문자열 반환
+        let args = s(&["quicsync", "rsync", "--server", ".", "/path"]);
+        assert_eq!(extract_rsync_server_args(&args), "");
     }
 }

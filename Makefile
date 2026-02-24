@@ -1,4 +1,4 @@
-.PHONY: build release test check clean install release-all dist
+.PHONY: build release test check clean install release-all dist bump
 
 UNAME_S := $(shell uname -s)
 
@@ -11,6 +11,8 @@ endif
 
 LINUX_TARGETS = x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 DIST_DIR = dist
+DEPLOY_SERVER := jwserver68
+SERVER_USER := root
 
 build:
 	cargo build
@@ -76,8 +78,18 @@ else
 	done
 endif
 
+# patch 버전 +1 (0.1.0 → 0.1.1)
+bump:
+	@CURRENT=$$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'); \
+	MAJOR=$$(echo $$CURRENT | cut -d. -f1); \
+	MINOR=$$(echo $$CURRENT | cut -d. -f2); \
+	PATCH=$$(echo $$CURRENT | cut -d. -f3); \
+	NEW="$$MAJOR.$$MINOR.$$((PATCH + 1))"; \
+	sed -i '' "s/^version = \"$$CURRENT\"/version = \"$$NEW\"/" Cargo.toml; \
+	echo "$$CURRENT → $$NEW"
+
 # 빌드 결과를 dist/에 모아서 배포용으로 정리
-dist: release-all
+dist: bump release-all
 	mkdir -p $(DIST_DIR)
 	@cp -f target/release/quicsync $(DIST_DIR)/quicsync-$(UNAME_S)-native 2>/dev/null || true
 	@for target in x86_64-apple-darwin $(LINUX_TARGETS); do \
@@ -88,3 +100,6 @@ dist: release-all
 	done
 	@echo "Artifacts in $(DIST_DIR)/:"
 	@ls -lh $(DIST_DIR)/
+
+deploy: dist
+	scp -p target/x86_64-unknown-linux-gnu/release/quicsync $(SERVER_USER)@$(DEPLOY_SERVER):/usr/local/bin/
