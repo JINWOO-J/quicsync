@@ -27,7 +27,7 @@ pub enum TransferDirection {
 /// CLI 인수 파싱 결과
 #[derive(Debug)]
 pub struct CliArgs {
-    pub local_path: PathBuf,
+    pub local_paths: Vec<PathBuf>,
     pub remote: RemoteSpec,
     pub rsync_options: Vec<String>,
     pub direction: TransferDirection,

@@ -70,12 +70,13 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
     let cmd = Command::new("quicsync")
         .version(env!("CARGO_PKG_VERSION"))
         .before_help(banner)
-        .override_usage("quicsync [rsync-options] SRC DST")
+        .override_usage("quicsync [rsync-options] SRC... DST")
         .after_help(
             "Examples:\n  \
              quicsync /local/dir user@remote:/remote/dir    # Push\n  \
              quicsync user@remote:/remote/dir /local/dir    # Pull\n  \
-             quicsync -avz --delete /src user@host:/dst     # With rsync options",
+             quicsync -avz --delete /src user@host:/dst     # With rsync options\n  \
+             quicsync ./* user@host:/dst                    # Multiple sources",
         )
         .arg(
             Arg::new("args")
@@ -104,39 +105,74 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
         ));
     }
 
-    let src = &trailing[trailing.len() - 2];
-    let dst = &trailing[trailing.len() - 1];
-    let rsync_options: Vec<String> = trailing[..trailing.len() - 2]
+    // trailing args를 rsync 옵션과 경로(positional)로 분리한다.
+    // `-`로 시작하는 인수는 rsync 옵션, 나머지는 경로로 취급한다.
+    let mut rsync_options = Vec::new();
+    let mut positionals = Vec::new();
+    for arg in &trailing {
+        if arg.starts_with('-') {
+            rsync_options.push(arg.to_string());
+        } else {
+            positionals.push(arg.as_str());
+        }
+    }
+
+    if positionals.len() < 2 {
+        return Err(CliError::InvalidArgs(
+            "SRC and DST are required".to_string(),
+        ));
+    }
+
+    // 마지막 positional = DST, 나머지 = SRC(들)
+    let dst = positionals.last().unwrap();
+    let srcs = &positionals[..positionals.len() - 1];
+
+    let dst_remote = is_remote(dst);
+    // SRC 중 하나라도 remote이면 Pull 모드 (remote source는 1개만 허용)
+    let remote_src_indices: Vec<usize> = srcs
         .iter()
-        .map(|s| s.to_string())
+        .enumerate()
+        .filter(|(_, s)| is_remote(s))
+        .map(|(i, _)| i)
         .collect();
 
-    let src_remote = is_remote(src);
-    let dst_remote = is_remote(dst);
+    if !remote_src_indices.is_empty() && dst_remote {
+        return Err(CliError::BothRemote);
+    }
 
-    match (src_remote, dst_remote) {
-        (false, false) => Err(CliError::BothLocal),
-        (true, true) => Err(CliError::BothRemote),
-        (false, true) => {
-            // Push: 로컬 → 원격
-            let remote = parse_remote(dst)?;
-            Ok(CliArgs {
-                local_path: PathBuf::from(src.as_str()),
-                remote,
-                rsync_options,
-                direction: TransferDirection::Push,
-            })
+    if remote_src_indices.is_empty() && !dst_remote {
+        return Err(CliError::BothLocal);
+    }
+
+    if dst_remote {
+        // Push: 모든 SRC가 로컬, DST가 원격
+        let remote = parse_remote(dst)?;
+        let local_paths = srcs.iter().map(|s| PathBuf::from(*s)).collect();
+        Ok(CliArgs {
+            local_paths,
+            remote,
+            rsync_options,
+            direction: TransferDirection::Push,
+        })
+    } else {
+        // Pull: SRC 중 하나가 원격, DST가 로컬
+        if remote_src_indices.len() > 1 {
+            return Err(CliError::BothRemote);
         }
-        (true, false) => {
-            // Pull: 원격 → 로컬
-            let remote = parse_remote(src)?;
-            Ok(CliArgs {
-                local_path: PathBuf::from(dst.as_str()),
-                remote,
-                rsync_options,
-                direction: TransferDirection::Pull,
-            })
+        let remote_idx = remote_src_indices[0];
+        let remote = parse_remote(srcs[remote_idx])?;
+        // Pull에서 remote가 아닌 SRC가 있으면 에러
+        if srcs.len() > 1 {
+            return Err(CliError::InvalidArgs(
+                "Pull mode supports only one remote source".to_string(),
+            ));
         }
+        Ok(CliArgs {
+            local_paths: vec![PathBuf::from(*dst)],
+            remote,
+            rsync_options,
+            direction: TransferDirection::Pull,
+        })
     }
 }
 
@@ -202,7 +238,7 @@ mod tests {
     fn parse_args_push_direction() {
         let a = args(&["quicsync", "/local/dir", "user@host:/remote/dir"]);
         let cli = parse_args(&a).unwrap();
-        assert_eq!(cli.local_path, PathBuf::from("/local/dir"));
+        assert_eq!(cli.local_paths, vec![PathBuf::from("/local/dir")]);
         assert_eq!(cli.remote.user.as_deref(), Some("user"));
         assert_eq!(cli.remote.host, "host");
         assert_eq!(cli.remote.path, "/remote/dir");
@@ -214,7 +250,7 @@ mod tests {
     fn parse_args_pull_direction() {
         let a = args(&["quicsync", "host:/data", "/local/data"]);
         let cli = parse_args(&a).unwrap();
-        assert_eq!(cli.local_path, PathBuf::from("/local/data"));
+        assert_eq!(cli.local_paths, vec![PathBuf::from("/local/data")]);
         assert_eq!(cli.remote.host, "host");
         assert_eq!(cli.remote.path, "/data");
         assert_eq!(cli.direction, TransferDirection::Pull);
@@ -232,7 +268,7 @@ mod tests {
         ]);
         let cli = parse_args(&a).unwrap();
         assert_eq!(cli.rsync_options, vec!["-avz", "--delete", "--exclude=*.tmp"]);
-        assert_eq!(cli.local_path, PathBuf::from("/src"));
+        assert_eq!(cli.local_paths, vec![PathBuf::from("/src")]);
         assert_eq!(cli.direction, TransferDirection::Push);
     }
 
@@ -264,7 +300,7 @@ mod tests {
     fn parse_args_relative_local_path() {
         let a = args(&["quicsync", "./relative/path", "host:/remote"]);
         let cli = parse_args(&a).unwrap();
-        assert_eq!(cli.local_path, PathBuf::from("./relative/path"));
+        assert_eq!(cli.local_paths, vec![PathBuf::from("./relative/path")]);
         assert_eq!(cli.direction, TransferDirection::Push);
     }
 
@@ -405,7 +441,7 @@ mod tests {
             prop_assert_eq!(cli.remote.user.as_deref(), Some(user.as_str()));
             prop_assert_eq!(&cli.remote.host, &host);
             prop_assert_eq!(&cli.remote.path, &remote_path);
-            prop_assert_eq!(cli.local_path, PathBuf::from(&local_path));
+            prop_assert_eq!(cli.local_paths, vec![PathBuf::from(&local_path)]);
             prop_assert_eq!(&cli.rsync_options, &rsync_opts);
             prop_assert_eq!(cli.direction, TransferDirection::Push);
         }
@@ -430,7 +466,7 @@ mod tests {
             prop_assert_eq!(cli.remote.user.as_deref(), Some(user.as_str()));
             prop_assert_eq!(&cli.remote.host, &host);
             prop_assert_eq!(&cli.remote.path, &remote_path);
-            prop_assert_eq!(cli.local_path, PathBuf::from(&local_path));
+            prop_assert_eq!(cli.local_paths, vec![PathBuf::from(&local_path)]);
             prop_assert_eq!(&cli.rsync_options, &rsync_opts);
             prop_assert_eq!(cli.direction, TransferDirection::Pull);
         }

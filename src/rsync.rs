@@ -1,6 +1,6 @@
 // rsync 자식 프로세스 실행 및 관리
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
 
 use tokio::process::{Child, Command};
@@ -25,12 +25,33 @@ fn format_remote_spec(remote: &RemoteSpec) -> String {
 /// 반환값: rsync에 전달할 전체 인수 벡터
 pub fn build_rsync_args(
     rsync_options: &[String],
-    local_path: &Path,
+    local_paths: &[PathBuf],
     remote: &RemoteSpec,
     proxy_port: u16,
     direction: TransferDirection,
 ) -> Vec<String> {
     let mut args = Vec::new();
+
+    // 사용자가 -a, -r, --archive, --recursive를 지정하지 않았으면 -a를 기본 추가.
+    // rsync는 -r 없이 디렉토리를 건너뛰므로, quicsync의 합리적 기본값으로 -a를 사용한다.
+    let has_recursive = rsync_options.iter().any(|opt| {
+        opt == "-r"
+            || opt == "-a"
+            || opt == "--recursive"
+            || opt == "--archive"
+            || (opt.starts_with('-')
+                && !opt.starts_with("--")
+                && (opt.contains('r') || opt.contains('a')))
+    });
+    if !has_recursive {
+        args.push("-a".to_string());
+    }
+
+    // --stats가 없으면 자동 추가하여 전송 요약을 항상 표시한다.
+    let has_stats = rsync_options.iter().any(|opt| opt == "--stats");
+    if !has_stats {
+        args.push("--stats".to_string());
+    }
 
     // 사용자 rsync 옵션을 그대로 전달 (Req 7.2)
     args.extend(rsync_options.iter().cloned());
@@ -46,18 +67,21 @@ pub fn build_rsync_args(
     args.push(format!("--rsh={} --connect {}", exe, proxy_port));
 
     let remote_spec = format_remote_spec(remote);
-    let local = local_path.to_string_lossy().to_string();
 
     match direction {
         TransferDirection::Push => {
-            // rsync [options] --rsh=... <local_path> <remote_spec>
-            args.push(local);
+            // rsync [options] --rsh=... <local_paths...> <remote_spec>
+            for p in local_paths {
+                args.push(p.to_string_lossy().to_string());
+            }
             args.push(remote_spec);
         }
         TransferDirection::Pull => {
             // rsync [options] --rsh=... <remote_spec> <local_path>
             args.push(remote_spec);
-            args.push(local);
+            for p in local_paths {
+                args.push(p.to_string_lossy().to_string());
+            }
         }
     }
 
@@ -71,12 +95,12 @@ impl RsyncChild {
     /// stderr를 캡처하여 비정상 종료 시 사용자에게 표시할 수 있도록 한다.
     pub fn spawn(
         rsync_options: &[String],
-        local_path: &Path,
+        local_paths: &[PathBuf],
         remote: &RemoteSpec,
         proxy_port: u16,
         direction: TransferDirection,
     ) -> Result<Self, RsyncError> {
-        let args = build_rsync_args(rsync_options, local_path, remote, proxy_port, direction);
+        let args = build_rsync_args(rsync_options, local_paths, remote, proxy_port, direction);
         tracing::debug!("rsync spawn: rsync {}", args.join(" "));
 
         let process = Command::new("rsync")
@@ -180,21 +204,33 @@ mod tests {
 
             let args = build_rsync_args(
                 &options,
-                Path::new(&local_path),
+                &[PathBuf::from(&local_path)],
                 &remote,
                 port,
                 direction,
             );
 
+            // -a 및 --stats 자동 추가 여부 판별
+            let has_recursive = options.iter().any(|opt| {
+                opt == "-r"
+                    || opt == "-a"
+                    || opt == "--recursive"
+                    || opt == "--archive"
+                    || (opt.starts_with('-')
+                        && !opt.starts_with("--")
+                        && (opt.contains('r') || opt.contains('a')))
+            });
+            let has_stats = options.iter().any(|opt| opt == "--stats");
+            let auto_prefix: usize = (!has_recursive as usize) + (!has_stats as usize);
             let n = options.len();
 
-            // (1) 사용자 옵션이 순서대로 args 앞부분에 위치
+            // (1) 사용자 옵션이 순서대로 args에 위치 (auto_prefix 오프셋 적용)
             for (i, opt) in options.iter().enumerate() {
-                prop_assert_eq!(&args[i], opt, "option at index {} mismatch", i);
+                prop_assert_eq!(&args[auto_prefix + i], opt, "option at index {} mismatch", i);
             }
 
             // (2) --rsh 옵션이 사용자 옵션 바로 뒤에 위치하며 올바른 포트 포함
-            let rsh = &args[n];
+            let rsh = &args[auto_prefix + n];
             let expected_suffix = format!(" --connect {}", port);
             prop_assert!(rsh.starts_with("--rsh="), "rsh should start with --rsh=, got: {}", rsh);
             prop_assert!(rsh.ends_with(&expected_suffix), "rsh should end with '{}', got: {}", expected_suffix, rsh);
@@ -208,19 +244,17 @@ mod tests {
             // (4) 방향에 따른 인수 순서 검증
             match direction {
                 TransferDirection::Push => {
-                    // Push: local_path, remote_spec
-                    prop_assert_eq!(&args[n + 1], &local_path);
-                    prop_assert_eq!(&args[n + 2], &expected_remote);
+                    prop_assert_eq!(&args[auto_prefix + n + 1], &local_path);
+                    prop_assert_eq!(&args[auto_prefix + n + 2], &expected_remote);
                 }
                 TransferDirection::Pull => {
-                    // Pull: remote_spec, local_path
-                    prop_assert_eq!(&args[n + 1], &expected_remote);
-                    prop_assert_eq!(&args[n + 2], &local_path);
+                    prop_assert_eq!(&args[auto_prefix + n + 1], &expected_remote);
+                    prop_assert_eq!(&args[auto_prefix + n + 2], &local_path);
                 }
             }
 
-            // 총 인수 개수: options + --rsh + local + remote = n + 3
-            prop_assert_eq!(args.len(), n + 3);
+            // 총 인수 개수: (auto_prefix) + options + --rsh + local + remote
+            prop_assert_eq!(args.len(), auto_prefix + n + 3);
         }
     }
 
@@ -233,17 +267,19 @@ mod tests {
         };
         let args = build_rsync_args(
             &["-avz".into(), "--delete".into()],
-            Path::new("/local/src"),
+            &[PathBuf::from("/local/src")],
             &remote,
             12345,
             TransferDirection::Push,
         );
 
-        assert_eq!(args[0], "-avz");
-        assert_eq!(args[1], "--delete");
-        assert!(args[2].starts_with("--rsh=") && args[2].ends_with(" --connect 12345"));
-        assert_eq!(args[3], "/local/src");
-        assert_eq!(args[4], "deploy@server.example.com:/data/backup");
+        // -avz에 'a' 포함 → -a 자동 추가 안 됨, --stats 자동 추가됨
+        assert_eq!(args[0], "--stats");
+        assert_eq!(args[1], "-avz");
+        assert_eq!(args[2], "--delete");
+        assert!(args[3].starts_with("--rsh=") && args[3].ends_with(" --connect 12345"));
+        assert_eq!(args[4], "/local/src");
+        assert_eq!(args[5], "deploy@server.example.com:/data/backup");
     }
 
     #[test]
@@ -255,17 +291,19 @@ mod tests {
         };
         let args = build_rsync_args(
             &["-r".into()],
-            Path::new("/local/dest"),
+            &[PathBuf::from("/local/dest")],
             &remote,
             54321,
             TransferDirection::Pull,
         );
 
-        assert_eq!(args[0], "-r");
-        assert!(args[1].starts_with("--rsh=") && args[1].ends_with(" --connect 54321"));
+        // -r에 'r' 포함 → -a 자동 추가 안 됨, --stats 자동 추가됨
+        assert_eq!(args[0], "--stats");
+        assert_eq!(args[1], "-r");
+        assert!(args[2].starts_with("--rsh=") && args[2].ends_with(" --connect 54321"));
         // Pull: remote first, then local
-        assert_eq!(args[2], "10.0.0.1:/remote/files");
-        assert_eq!(args[3], "/local/dest");
+        assert_eq!(args[3], "10.0.0.1:/remote/files");
+        assert_eq!(args[4], "/local/dest");
     }
 
     #[test]
@@ -277,16 +315,19 @@ mod tests {
         };
         let args = build_rsync_args(
             &[],
-            Path::new("/local"),
+            &[PathBuf::from("/local")],
             &remote,
             8080,
             TransferDirection::Push,
         );
 
-        assert!(args[0].starts_with("--rsh=") && args[0].ends_with(" --connect 8080"));
-        assert_eq!(args[1], "/local");
-        assert_eq!(args[2], "host:/path");
-        assert_eq!(args.len(), 3);
+        // 옵션 없으면 -a와 --stats가 자동 추가된다
+        assert_eq!(args[0], "-a");
+        assert_eq!(args[1], "--stats");
+        assert!(args[2].starts_with("--rsh=") && args[2].ends_with(" --connect 8080"));
+        assert_eq!(args[3], "/local");
+        assert_eq!(args[4], "host:/path");
+        assert_eq!(args.len(), 5);
     }
 
     #[test]
@@ -305,18 +346,20 @@ mod tests {
 
         let args = build_rsync_args(
             &options,
-            Path::new("/src"),
+            &[PathBuf::from("/src")],
             &remote,
             9999,
             TransferDirection::Push,
         );
 
+        // -a 포함 → -a 자동 추가 안 됨, --stats 자동 추가됨 (인덱스 +1)
         // 모든 사용자 옵션이 순서대로 보존되어야 한다 (Req 7.2)
+        assert_eq!(args[0], "--stats");
         for (i, opt) in options.iter().enumerate() {
-            assert_eq!(&args[i], opt);
+            assert_eq!(&args[i + 1], opt);
         }
         // --rsh 옵션이 사용자 옵션 뒤에 위치
-        assert!(args[options.len()].starts_with("--rsh=") && args[options.len()].ends_with(" --connect 9999"));
+        assert!(args[options.len() + 1].starts_with("--rsh=") && args[options.len() + 1].ends_with(" --connect 9999"));
     }
 
     #[test]

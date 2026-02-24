@@ -17,6 +17,7 @@ pub struct Session {
     ssh_process: tokio::process::Child,
     tunnel: QuicTunnel,
     rsync: RsyncChild,
+    started_at: std::time::Instant,
 }
 
 impl Session {
@@ -29,6 +30,23 @@ impl Session {
     /// 5. rsync 자식 프로세스 실행
     /// 6. Buffer relay 태스크 spawn
     pub async fn start(args: CliArgs) -> Result<Self, SessionError> {
+        let started_at = std::time::Instant::now();
+        let remote_display = match &args.remote.user {
+            Some(u) => format!("{}@{}:{}", u, args.remote.host, args.remote.path),
+            None => format!("{}:{}", args.remote.host, args.remote.path),
+        };
+        let direction_label = match args.direction {
+            crate::types::TransferDirection::Push => "push",
+            crate::types::TransferDirection::Pull => "pull",
+        };
+        eprintln!("quicsync: {} → {} ({})", remote_display, direction_label,
+            if args.local_paths.len() == 1 {
+                args.local_paths[0].display().to_string()
+            } else {
+                format!("{} paths", args.local_paths.len())
+            }
+        );
+
         // 1. SSH로 원격 서버 실행
         tracing::info!("launching remote server via SSH...");
         let handshake = launch_remote_server(&args.remote)
@@ -76,7 +94,7 @@ impl Session {
         // 5. rsync 자식 프로세스 실행
         let rsync = RsyncChild::spawn(
             &args.rsync_options,
-            &args.local_path,
+            &args.local_paths,
             &args.remote,
             proxy_port,
             args.direction,
@@ -116,6 +134,7 @@ impl Session {
             ssh_process,
             tunnel,
             rsync,
+            started_at,
         })
     }
 
@@ -126,7 +145,7 @@ impl Session {
     pub async fn run(self) -> Result<i32, SessionError> {
         let mut signal_rx = install_signal_handlers()?;
 
-        let Session { mut ssh_process, tunnel, rsync } = self;
+        let Session { mut ssh_process, tunnel, rsync, started_at } = self;
 
         tokio::select! {
             result = rsync.wait() => {
@@ -145,6 +164,12 @@ impl Session {
                     }
                 };
                 shutdown(tunnel, &mut ssh_process).await;
+                let elapsed = started_at.elapsed();
+                if code == 0 {
+                    eprintln!("quicsync: done in {:.2}s", elapsed.as_secs_f64());
+                } else {
+                    eprintln!("quicsync: rsync exited with code {code} in {:.2}s", elapsed.as_secs_f64());
+                }
                 Ok(code)
             }
             _ = signal_rx.changed() => {
