@@ -54,9 +54,29 @@ pub fn parse_remote(path: &str) -> Result<RemoteSpec, CliError> {
 /// `args`는 프로그램 이름을 포함한 전체 인수 목록이다.
 /// 형식: `quicsync [rsync options] SRC DST`
 pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
+    let banner = format!(
+        r#"
+   __ _ _   _(_) ___ ___ _   _ _ __   ___
+  / _` | | | | |/ __/ __| | | | '_ \ / __|
+ | (_| | |_| | | (__\__ \ |_| | | | | (__
+  \__, |\__,_|_|\___|___/\__, |_| |_|\___|
+     |_|                 |___/        v{}
+
+  rsync over QUIC tunnel — fast file sync for long-distance networks
+"#,
+        env!("CARGO_PKG_VERSION")
+    );
+
     let cmd = Command::new("quicsync")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("rsync over QUIC tunnel — fast file sync for long-distance networks")
+        .before_help(banner)
+        .override_usage("quicsync [rsync-options] SRC DST")
+        .after_help(
+            "Examples:\n  \
+             quicsync /local/dir user@remote:/remote/dir    # Push\n  \
+             quicsync user@remote:/remote/dir /local/dir    # Pull\n  \
+             quicsync -avz --delete /src user@host:/dst     # With rsync options",
+        )
         .arg(
             Arg::new("args")
                 .num_args(1..)
@@ -64,9 +84,14 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
                 .allow_hyphen_values(true),
         );
 
-    let matches = cmd
-        .try_get_matches_from(args)
-        .map_err(|e| CliError::InvalidArgs(e.to_string()))?;
+    let matches = cmd.try_get_matches_from(args).map_err(|e| {
+        // --help, --version은 clap이 직접 출력하고 정상 종료한다.
+        if e.use_stderr() {
+            CliError::InvalidArgs(e.to_string())
+        } else {
+            e.exit();
+        }
+    })?;
 
     let trailing: Vec<&String> = matches
         .get_many::<String>("args")
