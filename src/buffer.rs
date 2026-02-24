@@ -134,6 +134,7 @@ impl BufferLayer {
                         }
                         None => {
                             // tcp_rx 종료 — 모든 데이터 전송 완료
+                            tracing::debug!("relay_forward: tcp_rx closed, calling quic_tx.finish()");
                             quic_tx.finish().map_err(|e| {
                                 BufferError::InvalidSize(format!("quic finish: {e}"))
                             })?;
@@ -170,6 +171,7 @@ impl BufferLayer {
 
             if n == 0 {
                 // QUIC 스트림 종료
+                tracing::debug!("relay_reverse: QUIC recv_stream EOF, closing channel");
                 return Ok(());
             }
 

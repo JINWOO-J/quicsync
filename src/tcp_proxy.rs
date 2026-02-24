@@ -64,7 +64,10 @@ impl TcpProxy {
             let mut buf = vec![0u8; TCP_READ_BUF_SIZE];
             loop {
                 match read_half.read(&mut buf).await {
-                    Ok(0) => break Ok(()), // rsync가 연결 종료
+                    Ok(0) => {
+                        tracing::debug!("tcp_proxy: TCP read EOF (rsync/connect closed write side)");
+                        break Ok(());
+                    }
                     Ok(n) => {
                         if tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
                             break Ok(()); // receiver dropped
@@ -82,6 +85,8 @@ impl TcpProxy {
                     return Err(ProxyError::RelayError(format!("tcp write: {e}")));
                 }
             }
+            tracing::debug!("tcp_proxy: tcp_write channel closed, shutting down write half");
+            let _ = write_half.shutdown().await;
             Ok(())
         });
 

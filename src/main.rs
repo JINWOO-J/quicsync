@@ -80,23 +80,48 @@ async fn run_connect(port: u16, raw_args: &[String]) -> ExitCode {
     let mut stdout = tokio::io::stdout();
 
     // stdin → tcp: rsync가 보내는 데이터를 TCP 프록시로 전달
-    // rsync가 전송 완료 후 stdin을 닫으면 tcp_write도 shutdown하여
-    // 서버에 EOF를 전파한다.
+    // 주의: stdin EOF 시 tcp_write.shutdown()을 호출하지 않는다.
+    // TCP 반닫기(half-close)가 프록시 → QUIC → 서버로 전파되면
+    // 원격 rsync의 stdin이 닫혀 전송이 중단될 수 있기 때문이다.
+    // --connect 프로세스가 종료되면 TCP 연결이 자동으로 닫힌다.
     let fwd = async {
-        let r = tokio::io::copy(&mut stdin, &mut tcp_write).await;
-        let _ = tcp_write.shutdown().await;
-        r
+        tokio::io::copy(&mut stdin, &mut tcp_write).await
     };
 
     // tcp → stdout: 서버에서 오는 데이터를 rsync에 전달
-    let rev = tokio::io::copy(&mut tcp_read, &mut stdout);
+    // rsync는 pipe로 stdout을 읽으므로 반드시 flush해야 한다.
+    let rev = async {
+        let r = tokio::io::copy(&mut tcp_read, &mut stdout).await;
+        let _ = stdout.flush().await;
+        r
+    };
 
-    let (r1, r2) = tokio::join!(fwd, rev);
+    tokio::pin!(fwd);
+    tokio::pin!(rev);
 
-    if r1.is_err() && r2.is_err() {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
+    // 양방향 중계를 select!로 실행한다.
+    //
+    // - rev 완료 시: 전송이 끝난 것이므로 fd 0을 닫아
+    //   tokio blocking stdin reader를 중단시키고 정상 종료한다.
+    // - fwd 완료 시: rsync가 write pipe를 닫은 것이므로
+    //   rev가 나머지 데이터를 모두 전달할 때까지 대기한다.
+    //   (pull 모드에서 rsync는 제어 메시지 전송 완료 후 stdin을 닫지만,
+    //   파일 데이터는 rev 방향으로 아직 수신 중일 수 있다.)
+    tokio::select! {
+        r = &mut fwd => {
+            eprintln!("quicsync --connect: fwd done: {r:?}");
+            // fwd 완료 후 rev가 남은 데이터를 전달할 때까지 대기
+            let rev_r = rev.await;
+            eprintln!("quicsync --connect: rev done (after fwd): {rev_r:?}");
+            if r.is_err() || rev_r.is_err() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+        }
+        r = &mut rev => {
+            eprintln!("quicsync --connect: rev done: {r:?}");
+            // stdin fd를 닫아 blocking read를 중단시킨다.
+            // SAFETY: fd 0을 닫는 것은 이 프로세스에서만 영향을 미친다.
+            unsafe { libc::close(0); }
+            if r.is_err() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+        }
     }
 }
 

@@ -9,7 +9,20 @@
       "Bash(echo EXIT CODE: $?:*)",
       "Bash(rm:*)",
       "Bash(echo cross not found:*)",
-      "Bash(make deploy:*)"
+      "Bash(make deploy:*)",
+      "Bash(ssh root@jwserver68:*)",
+      "Bash(rsync:*)",
+      "Bash(echo local binary not built:*)",
+      "Bash(timeout 30 ~/.local/bin/quicsync:*)",
+      "Bash(timeout 20 ~/.local/bin/quicsync:*)",
+      "Bash(::*)",
+      "Bash(timeout 20 /Users/jinwoo/.local/bin/quicsync:*)",
+      "Bash(echo no --version flag:*)",
+      "Bash(echo EXIT=$?:*)",
+      "Bash(timeout 15 ~/.local/bin/quicsync:*)",
+      "Bash(scp:*)",
+      "Bash(echo done:*)",
+      "Bash(md5 -q /tmp/test-pull.bin && ssh root@jwserver68 'md5sum /app/upload-test/test-100k.bin' 2>&1)"
     ]
   }
 }
