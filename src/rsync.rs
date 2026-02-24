@@ -32,21 +32,6 @@ pub fn build_rsync_args(
 ) -> Vec<String> {
     let mut args = Vec::new();
 
-    // 사용자가 -a, -r, --archive, --recursive를 지정하지 않았으면 -a를 기본 추가.
-    // rsync는 -r 없이 디렉토리를 건너뛰므로, quicsync의 합리적 기본값으로 -a를 사용한다.
-    let has_recursive = rsync_options.iter().any(|opt| {
-        opt == "-r"
-            || opt == "-a"
-            || opt == "--recursive"
-            || opt == "--archive"
-            || (opt.starts_with('-')
-                && !opt.starts_with("--")
-                && (opt.contains('r') || opt.contains('a')))
-    });
-    if !has_recursive {
-        args.push("-a".to_string());
-    }
-
     // --stats가 없으면 자동 추가하여 전송 요약을 항상 표시한다.
     let has_stats = rsync_options.iter().any(|opt| opt == "--stats");
     if !has_stats {
@@ -210,18 +195,9 @@ mod tests {
                 direction,
             );
 
-            // -a 및 --stats 자동 추가 여부 판별
-            let has_recursive = options.iter().any(|opt| {
-                opt == "-r"
-                    || opt == "-a"
-                    || opt == "--recursive"
-                    || opt == "--archive"
-                    || (opt.starts_with('-')
-                        && !opt.starts_with("--")
-                        && (opt.contains('r') || opt.contains('a')))
-            });
+            // --stats 자동 추가 여부 판별
             let has_stats = options.iter().any(|opt| opt == "--stats");
-            let auto_prefix: usize = (!has_recursive as usize) + (!has_stats as usize);
+            let auto_prefix: usize = !has_stats as usize;
             let n = options.len();
 
             // (1) 사용자 옵션이 순서대로 args에 위치 (auto_prefix 오프셋 적용)
@@ -321,13 +297,12 @@ mod tests {
             TransferDirection::Push,
         );
 
-        // 옵션 없으면 -a와 --stats가 자동 추가된다
-        assert_eq!(args[0], "-a");
-        assert_eq!(args[1], "--stats");
-        assert!(args[2].starts_with("--rsh=") && args[2].ends_with(" --connect 8080"));
-        assert_eq!(args[3], "/local");
-        assert_eq!(args[4], "host:/path");
-        assert_eq!(args.len(), 5);
+        // 옵션 없으면 --stats만 자동 추가된다
+        assert_eq!(args[0], "--stats");
+        assert!(args[1].starts_with("--rsh=") && args[1].ends_with(" --connect 8080"));
+        assert_eq!(args[2], "/local");
+        assert_eq!(args[3], "host:/path");
+        assert_eq!(args.len(), 4);
     }
 
     #[test]
