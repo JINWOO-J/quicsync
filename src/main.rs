@@ -12,6 +12,9 @@ async fn main() -> ExitCode {
     // rsync가 rsh로 호출할 때 "rsync --server ..." 인수가 뒤에 붙으므로,
     // --server보다 --connect를 먼저 검사해야 한다.
     if let Some(port) = parse_connect_flag(&raw_args) {
+        // --connect 모드에서는 tracing을 초기화하지 않는다.
+        // stdout/stderr가 rsync 프로토콜 통신에 사용되므로,
+        // tracing 출력이 프로토콜 데이터를 오염시킬 수 있다.
         return run_connect(port, &raw_args).await;
     }
 
@@ -67,7 +70,18 @@ async fn run_connect(port: u16, raw_args: &[String]) -> ExitCode {
         }
     };
 
-    let (mut tcp_read, mut tcp_write) = stream.into_split();
+    // tokio::io::split()을 사용한다 (TcpStream::into_split() 대신).
+    //
+    // into_split()의 OwnedWriteHalf는 drop 시 TCP FIN을 전송한다.
+    // pull 모드에서 fwd 태스크가 완료되어 tcp_write가 drop되면:
+    //   FIN → proxy tcp_read EOF → relay_forward quic_tx.finish()
+    //   → server child_stdin.shutdown() → 원격 rsync sender 중단
+    // 이로 인해 역방향 데이터 전송이 조기 종료된다.
+    //
+    // io::split()은 내부적으로 Arc<Mutex<TcpStream>>을 사용하므로
+    // write half가 drop되어도 underlying 소켓은 닫히지 않는다.
+    // TCP 연결은 --connect 프로세스 종료 시에만 닫힌다.
+    let (mut tcp_read, mut tcp_write) = tokio::io::split(stream);
 
     // rsync 서버 인수를 TCP 프록시를 통해 원격 서버로 전송
     let args_line = format!("{rsync_server_args}\n");
@@ -79,44 +93,53 @@ async fn run_connect(port: u16, raw_args: &[String]) -> ExitCode {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 
-    // stdin → tcp: rsync가 보내는 데이터를 TCP 프록시로 전달
-    // 주의: stdin EOF 시 tcp_write.shutdown()을 호출하지 않는다.
-    // TCP 반닫기(half-close)가 프록시 → QUIC → 서버로 전파되면
-    // 원격 rsync의 stdin이 닫혀 전송이 중단될 수 있기 때문이다.
-    // --connect 프로세스가 종료되면 TCP 연결이 자동으로 닫힌다.
-    let fwd = async {
+    // stdin → tcp: rsync가 보내는 데이터를 TCP 프록시로 전달.
+    //
+    // tokio::spawn으로 분리하는 이유: tokio::io::stdin()이 blocking thread를
+    // 사용하므로, rev가 먼저 완료될 때 libc::close(0)으로 stdin을 닫아
+    // blocking read를 중단시켜야 한다.
+    // stdout/stdin이 non-blocking 모드로 설정되어 있으면 blocking으로 복원.
+    // tokio 런타임이 fd를 non-blocking으로 설정할 수 있으며,
+    // tokio::io::copy가 pipe에 EAGAIN을 만나면 에러로 처리될 수 있다.
+    unsafe {
+        for fd in [0, 1] {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 && (flags & libc::O_NONBLOCK) != 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+            }
+        }
+    }
+    let fwd = tokio::spawn(async move {
         tokio::io::copy(&mut stdin, &mut tcp_write).await
-    };
+    });
 
-    // tcp → stdout: 서버에서 오는 데이터를 rsync에 전달
-    // rsync는 pipe로 stdout을 읽으므로 반드시 flush해야 한다.
+    // tcp → stdout: 서버에서 오는 데이터를 rsync에 전달.
     let rev = async {
         let r = tokio::io::copy(&mut tcp_read, &mut stdout).await;
         let _ = stdout.flush().await;
         r
     };
 
-    tokio::pin!(fwd);
     tokio::pin!(rev);
 
     // 양방향 중계를 select!로 실행한다.
     //
-    // - rev 완료 시: 전송이 끝난 것이므로 fd 0을 닫아
-    //   tokio blocking stdin reader를 중단시키고 정상 종료한다.
-    // - fwd 완료 시: rsync가 write pipe를 닫은 것이므로
-    //   rev가 나머지 데이터를 모두 전달할 때까지 대기한다.
-    //   (pull 모드에서 rsync는 제어 메시지 전송 완료 후 stdin을 닫지만,
-    //   파일 데이터는 rev 방향으로 아직 수신 중일 수 있다.)
+    // - fwd 완료 시: local rsync가 stdout을 닫음 (보통 프로세스 종료 시).
+    //   rev가 완료될 때까지 대기하여 역방향 데이터를 모두 수신한다.
+    //
+    // - rev 완료 시: TCP 읽기 EOF (서버에서 모든 데이터 수신 완료) 또는
+    //   stdout EPIPE (local rsync 종료).
+    //   fd 0을 닫아 tokio blocking stdin reader를 중단시키고 정상 종료한다.
     tokio::select! {
-        r = &mut fwd => {
-            eprintln!("quicsync --connect: fwd done: {r:?}");
-            // fwd 완료 후 rev가 남은 데이터를 전달할 때까지 대기
+        join_r = fwd => {
+            let r = match join_r {
+                Ok(inner) => inner,
+                Err(e) => Err(std::io::Error::other(format!("fwd task: {e}"))),
+            };
             let rev_r = rev.await;
-            eprintln!("quicsync --connect: rev done (after fwd): {rev_r:?}");
             if r.is_err() || rev_r.is_err() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
         }
         r = &mut rev => {
-            eprintln!("quicsync --connect: rev done: {r:?}");
             // stdin fd를 닫아 blocking read를 중단시킨다.
             // SAFETY: fd 0을 닫는 것은 이 프로세스에서만 영향을 미친다.
             unsafe { libc::close(0); }

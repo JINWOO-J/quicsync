@@ -176,6 +176,17 @@ impl RemoteServer {
             .await
             .map_err(|e| ServerError::RelayError(format!("wait: {e}")))?;
 
+        // 클라이언트가 모든 데이터를 수신한 후 연결을 닫을 때까지 대기.
+        // send_stream.finish() 직후 endpoint.close()를 호출하면
+        // QUIC CONNECTION_CLOSE가 스트림 데이터보다 먼저 도착하여
+        // 클라이언트가 데이터를 유실할 수 있다.
+        tokio::select! {
+            _ = connection.closed() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                eprintln!("[quicsync-server] timeout waiting for client to close connection");
+            }
+        }
+
         // 리소스 정리: endpoint 종료
         self.endpoint.close(0u32.into(), b"done");
 

@@ -29,6 +29,7 @@ pub async fn launch_remote_server(
         .arg(&ssh_target)
         .arg("quicsync")
         .arg("--server")
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

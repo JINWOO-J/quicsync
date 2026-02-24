@@ -77,6 +77,7 @@ impl RsyncChild {
         direction: TransferDirection,
     ) -> Result<Self, RsyncError> {
         let args = build_rsync_args(rsync_options, local_path, remote, proxy_port, direction);
+        tracing::debug!("rsync spawn: rsync {}", args.join(" "));
 
         let process = Command::new("rsync")
             .args(&args)

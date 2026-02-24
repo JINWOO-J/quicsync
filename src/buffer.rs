@@ -122,19 +122,21 @@ impl BufferLayer {
         mut quic_tx: SendStream,
     ) -> Result<(), BufferError> {
         let keepalive_interval = Duration::from_secs(30);
+        let mut total_bytes = 0u64;
 
         loop {
             tokio::select! {
                 maybe_data = tcp_rx.recv() => {
                     match maybe_data {
                         Some(data) => {
+                            total_bytes += data.len() as u64;
                             quic_tx.write_all(&data).await.map_err(|e| {
                                 BufferError::InvalidSize(format!("quic write: {e}"))
                             })?;
                         }
                         None => {
                             // tcp_rx 종료 — 모든 데이터 전송 완료
-                            tracing::debug!("relay_forward: tcp_rx closed, calling quic_tx.finish()");
+                            tracing::debug!("relay_forward: tcp_rx closed after {total_bytes} bytes, calling quic_tx.finish()");
                             quic_tx.finish().map_err(|e| {
                                 BufferError::InvalidSize(format!("quic finish: {e}"))
                             })?;
@@ -163,20 +165,31 @@ impl BufferLayer {
         tcp_tx: mpsc::Sender<Bytes>,
     ) -> Result<(), BufferError> {
         let mut buf = vec![0u8; 64 * 1024]; // 64KB 읽기 버퍼
+        let mut total_bytes = 0u64;
+        let mut chunk_count = 0u64;
 
         loop {
             let n = quic_rx.read(&mut buf).await
-                .map_err(|e| BufferError::InvalidSize(format!("quic read: {e}")))?
+                .map_err(|e| {
+                    tracing::error!("relay_reverse: QUIC read error after {total_bytes} bytes ({chunk_count} chunks): {e}");
+                    BufferError::InvalidSize(format!("quic read: {e}"))
+                })?
                 .unwrap_or(0);
 
             if n == 0 {
                 // QUIC 스트림 종료
-                tracing::debug!("relay_reverse: QUIC recv_stream EOF, closing channel");
+                tracing::debug!("relay_reverse: QUIC recv_stream EOF after {total_bytes} bytes ({chunk_count} chunks)");
                 return Ok(());
             }
 
+            chunk_count += 1;
+            total_bytes += n as u64;
+
             tcp_tx.send(Bytes::copy_from_slice(&buf[..n])).await
-                .map_err(|_| BufferError::InvalidSize("tcp_tx channel closed".into()))?;
+                .map_err(|_| {
+                    tracing::error!("relay_reverse: tcp_tx channel closed after {total_bytes} bytes ({chunk_count} chunks)");
+                    BufferError::InvalidSize("tcp_tx channel closed".into())
+                })?;
         }
     }
 }

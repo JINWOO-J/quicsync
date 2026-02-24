@@ -62,30 +62,41 @@ impl TcpProxy {
         let tx = tcp_to_quic;
         let tcp_read = tokio::spawn(async move {
             let mut buf = vec![0u8; TCP_READ_BUF_SIZE];
+            let mut total_bytes = 0u64;
             loop {
                 match read_half.read(&mut buf).await {
                     Ok(0) => {
-                        tracing::debug!("tcp_proxy: TCP read EOF (rsync/connect closed write side)");
+                        tracing::debug!("tcp_proxy: TCP read EOF after {total_bytes} bytes");
                         break Ok(());
                     }
                     Ok(n) => {
+                        total_bytes += n as u64;
                         if tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
+                            tracing::debug!("tcp_proxy: tcp_read fwd_tx receiver dropped after {total_bytes} bytes");
                             break Ok(()); // receiver dropped
                         }
                     }
-                    Err(e) => break Err(ProxyError::RelayError(format!("tcp read: {e}"))),
+                    Err(e) => {
+                        tracing::error!("tcp_proxy: TCP read error after {total_bytes} bytes: {e}");
+                        break Err(ProxyError::RelayError(format!("tcp read: {e}")));
+                    }
                 }
             }
         });
 
         // channel → TCP (Buffer_Layer → rsync 방향)
         let tcp_write = tokio::spawn(async move {
+            let mut total_bytes = 0u64;
+            let mut chunk_count = 0u64;
             while let Some(data) = quic_to_tcp.recv().await {
+                chunk_count += 1;
+                total_bytes += data.len() as u64;
                 if let Err(e) = write_half.write_all(&data).await {
+                    tracing::error!("tcp_proxy: tcp_write write_all FAILED after {total_bytes} bytes ({chunk_count} chunks): {e}");
                     return Err(ProxyError::RelayError(format!("tcp write: {e}")));
                 }
             }
-            tracing::debug!("tcp_proxy: tcp_write channel closed, shutting down write half");
+            tracing::debug!("tcp_proxy: tcp_write channel closed after {total_bytes} bytes ({chunk_count} chunks), shutting down write half");
             let _ = write_half.shutdown().await;
             Ok(())
         });
@@ -93,12 +104,14 @@ impl TcpProxy {
         // 어느 한쪽이 끝나면 나머지도 정리
         tokio::select! {
             result = tcp_read => {
+                tracing::debug!("tcp_proxy: select! → tcp_read completed first");
                 match result {
                     Ok(inner) => inner?,
                     Err(e) => return Err(ProxyError::RelayError(format!("tcp_read task: {e}"))),
                 }
             }
             result = tcp_write => {
+                tracing::debug!("tcp_proxy: select! → tcp_write completed first");
                 match result {
                     Ok(inner) => inner?,
                     Err(e) => return Err(ProxyError::RelayError(format!("tcp_write task: {e}"))),
