@@ -36,9 +36,12 @@ impl Session {
             .map_err(|e| SessionError::InitFailed(format!("SSH: {e}")))?;
 
         let ssh_process = handshake.ssh_process;
-        let remote_addr: SocketAddr = format!("{}:{}", args.remote.host, handshake.remote_port)
-            .parse()
-            .map_err(|e| SessionError::InitFailed(format!("invalid remote addr: {e}")))?;
+        let host_port = format!("{}:{}", args.remote.host, handshake.remote_port);
+        let remote_addr: SocketAddr = tokio::net::lookup_host(&host_port)
+            .await
+            .map_err(|e| SessionError::InitFailed(format!("DNS resolve {host_port}: {e}")))?
+            .next()
+            .ok_or_else(|| SessionError::InitFailed(format!("no address found for {host_port}")))?;
 
         // 2. QUIC 터널 수립
         tracing::info!("connecting QUIC tunnel to {}...", remote_addr);

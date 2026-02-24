@@ -31,7 +31,7 @@ impl RemoteServer {
             .with_single_cert(vec![cert], key)
             .map_err(|e| ServerError::StartFailed(format!("TLS config: {e}")))?;
 
-        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
         let endpoint = build_server_endpoint(bind_addr, tls_config)
             .map_err(|e| ServerError::StartFailed(format!("endpoint: {e}")))?;
 
