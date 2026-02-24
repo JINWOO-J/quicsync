@@ -74,12 +74,24 @@ impl RemoteServer {
     /// 6. QUIC 스트림 ↔ rsync stdin/stdout 양방향 중계
     /// 7. rsync 종료 코드 반환
     pub async fn accept_and_serve(self) -> Result<i32, ServerError> {
-        // 1. 단일 연결 수락
-        let incoming = self
-            .endpoint
-            .accept()
-            .await
-            .ok_or_else(|| ServerError::StartFailed("endpoint closed".into()))?;
+        // 1. 단일 연결 수락 (SSH stdin EOF 감지 시 자동 종료)
+        let stdin_closed = async {
+            let mut stdin = tokio::io::stdin();
+            let mut buf = [0u8; 1];
+            // SSH가 끊어지면 stdin이 EOF를 반환한다
+            let _ = tokio::io::AsyncReadExt::read(&mut stdin, &mut buf).await;
+        };
+
+        let incoming = tokio::select! {
+            incoming = self.endpoint.accept() => {
+                incoming.ok_or_else(|| ServerError::StartFailed("endpoint closed".into()))?
+            }
+            _ = stdin_closed => {
+                // SSH 연결 끊김 → 정리 후 종료
+                self.endpoint.close(0u32.into(), b"ssh disconnected");
+                return Ok(0);
+            }
+        };
 
         let connection = incoming
             .await
