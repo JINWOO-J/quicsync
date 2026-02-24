@@ -38,8 +38,12 @@ pub fn build_rsync_args(
     // --rsh 옵션으로 TCP_Proxy 포트를 통해 연결하도록 리다이렉션 (Req 7.1)
     // rsync는 --rsh 프로그램을 `PROGRAM host rsync --server ...` 형태로 호출한다.
     // quicsync --connect 모드가 localhost:proxy_port에 TCP 연결 후 stdin/stdout relay를 수행한다.
-    // rsync가 추가하는 인수(host, --server 등)는 자동으로 무시된다.
-    args.push(format!("--rsh=quicsync --connect {}", proxy_port));
+    // current_exe()로 현재 실행 중인 바이너리의 전체 경로를 사용하여
+    // PATH에 설치된 다른 버전이 호출되는 문제를 방지한다.
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "quicsync".to_string());
+    args.push(format!("--rsh={} --connect {}", exe, proxy_port));
 
     let remote_spec = format_remote_spec(remote);
     let local = local_path.to_string_lossy().to_string();
@@ -190,8 +194,9 @@ mod tests {
 
             // (2) --rsh 옵션이 사용자 옵션 바로 뒤에 위치하며 올바른 포트 포함
             let rsh = &args[n];
-            let expected_rsh = format!("--rsh=quicsync --connect {}", port);
-            prop_assert_eq!(rsh, &expected_rsh);
+            let expected_suffix = format!(" --connect {}", port);
+            prop_assert!(rsh.starts_with("--rsh="), "rsh should start with --rsh=, got: {}", rsh);
+            prop_assert!(rsh.ends_with(&expected_suffix), "rsh should end with '{}', got: {}", expected_suffix, rsh);
 
             // (3) remote spec 포맷 검증
             let expected_remote = match &user {
@@ -235,7 +240,7 @@ mod tests {
 
         assert_eq!(args[0], "-avz");
         assert_eq!(args[1], "--delete");
-        assert_eq!(args[2], "--rsh=quicsync --connect 12345");
+        assert!(args[2].starts_with("--rsh=") && args[2].ends_with(" --connect 12345"));
         assert_eq!(args[3], "/local/src");
         assert_eq!(args[4], "deploy@server.example.com:/data/backup");
     }
@@ -256,7 +261,7 @@ mod tests {
         );
 
         assert_eq!(args[0], "-r");
-        assert_eq!(args[1], "--rsh=quicsync --connect 54321");
+        assert!(args[1].starts_with("--rsh=") && args[1].ends_with(" --connect 54321"));
         // Pull: remote first, then local
         assert_eq!(args[2], "10.0.0.1:/remote/files");
         assert_eq!(args[3], "/local/dest");
@@ -277,7 +282,7 @@ mod tests {
             TransferDirection::Push,
         );
 
-        assert_eq!(args[0], "--rsh=quicsync --connect 8080");
+        assert!(args[0].starts_with("--rsh=") && args[0].ends_with(" --connect 8080"));
         assert_eq!(args[1], "/local");
         assert_eq!(args[2], "host:/path");
         assert_eq!(args.len(), 3);
@@ -310,7 +315,7 @@ mod tests {
             assert_eq!(&args[i], opt);
         }
         // --rsh 옵션이 사용자 옵션 뒤에 위치
-        assert_eq!(args[options.len()], "--rsh=quicsync --connect 9999");
+        assert!(args[options.len()].starts_with("--rsh=") && args[options.len()].ends_with(" --connect 9999"));
     }
 
     #[test]
