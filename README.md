@@ -57,7 +57,15 @@ quicsync user@remote:/remote/dir /local/dir
 
 # rsync 옵션 전달
 quicsync -avz --delete --exclude='*.tmp' /src user@server:/dst
+
+# 멀티소스 경로 (glob 패턴)
+quicsync ./* user@host:/dst
+
+# QUIC 윈도우 크기 설정 (기본 64MB, 높은 RTT에서 증가 권장)
+quicsync --window 128 /src user@host:/dst
 ```
+
+`--stats`는 자동으로 추가되어 전송 완료 시 rsync 통계 요약이 항상 표시된다. 전송 시작 시 방향과 경로를 표시하고, 완료 시 경과 시간을 출력한다.
 
 ### 지원하는 경로 형식
 
@@ -67,6 +75,16 @@ quicsync -avz --delete --exclude='*.tmp' /src user@server:/dst
 | `host:path` | 현재 사용자로 원격 접속 |
 | `/absolute/path` | 로컬 절대 경로 |
 | `./relative/path` | 로컬 상대 경로 |
+
+Push 모드에서는 여러 소스 경로를 지정할 수 있다 (glob 패턴 포함). Pull 모드에서는 원격 소스 1개만 지원한다.
+
+### quicsync 전용 옵션
+
+| 옵션 | 설명 | 기본값 |
+|------|------|--------|
+| `--window MB` | QUIC flow control 윈도우 크기 (MB) | 64 |
+
+`--window` 이외의 모든 옵션은 rsync에 그대로 전달된다.
 
 ## 벤치마크
 
@@ -126,14 +144,14 @@ RUST_LOG=debug quicsync /src user@host:/dst
 # 빌드
 cargo build
 
-# 전체 테스트 실행 (75개 테스트, property-based 테스트 포함)
+# 전체 테스트 실행 (80개 테스트, property-based 테스트 포함)
 cargo test
 
 # 릴리스 빌드
 cargo build --release
 ```
 
-테스트는 `proptest` 기반 property-based testing을 포함하며, CLI 파싱, Ring Buffer, 핸드셰이크 프로토콜, 데이터 무결성, 인증 토큰, rsync 명령어 구성, 종료 코드 전파 등 10개 correctness property를 검증한다.
+테스트는 `proptest` 기반 property-based testing을 포함하며 (68 unit + 12 property-based), CLI 파싱, Ring Buffer, 핸드셰이크 프로토콜, 데이터 무결성, 인증 토큰, rsync 명령어 구성, 종료 코드 전파 등 10개 correctness property를 검증한다.
 
 ## 프로젝트 구조
 
@@ -167,7 +185,7 @@ src/
 ## 제한사항 (Phase 1 MVP)
 
 - 양측 호스트 모두에 `quicsync` 설치 필요
-- Linux x86_64/ARM64 대상 (macOS 지원은 Phase 2)
+- Linux x86_64/ARM64 대상 (macOS는 원격 호스트로 지원, 로컬 macOS는 미검증)
 - UDP 차단 환경에서의 TCP 폴백 미지원
 - rsync daemon mode (`rsync://`) 미지원
 
