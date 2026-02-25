@@ -16,6 +16,35 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4"
 libc = "0.2"
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Optional: OpenTelemetry (feature-gated)
+opentelemetry = { version = "0.22", optional = true }
+opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.15", optional = true }
+
+[features]
+default = []
+otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp"]
 
 [dev-dependencies]
 proptest = "1"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "ring_buffer"
+harness = false
+
+[[bench]]
+name = "auth_token"
+harness = false
+
+[[bench]]
+name = "tcp_proxy"
+harness = false
+
+[[bench]]
+name = "quic_tunnel"
+harness = false

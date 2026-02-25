@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::error::ServerError;
-use crate::quic::{build_server_endpoint, generate_self_signed_cert};
+use crate::quic::{build_server_endpoint, generate_self_signed_cert, sha256_fingerprint, fingerprint_to_hex};
 use crate::types::AuthToken;
 
 /// 원격 서버: QUIC 리스닝 → 토큰 검증 → rsync 중계
@@ -18,6 +18,7 @@ pub struct RemoteServer {
     pub endpoint: quinn::Endpoint,
     pub port: u16,
     pub auth_token: AuthToken,
+    pub cert_fingerprint: String,
 }
 
 impl RemoteServer {
@@ -25,6 +26,9 @@ impl RemoteServer {
     pub async fn start() -> Result<Self, ServerError> {
         let (cert, key) = generate_self_signed_cert()
             .map_err(|e| ServerError::StartFailed(format!("cert generation: {e}")))?;
+
+        let cert_fp = sha256_fingerprint(cert.as_ref());
+        let cert_fingerprint = fingerprint_to_hex(&cert_fp);
 
         let tls_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -46,13 +50,19 @@ impl RemoteServer {
             endpoint,
             port,
             auth_token,
+            cert_fingerprint,
         })
     }
 
     /// stdout으로 핸드셰이크 정보를 출력한다.
-    /// 형식: `QUICSYNC_READY <port> <token>\n`
+    /// 형식: `QUICSYNC_READY <port> <token> <fingerprint>\n`
     pub fn emit_handshake(&self) {
-        println!("QUICSYNC_READY {} {}", self.port, self.auth_token.to_hex());
+        println!(
+            "QUICSYNC_READY {} {} {}",
+            self.port,
+            self.auth_token.to_hex(),
+            self.cert_fingerprint,
+        );
     }
 
     /// 인증 토큰 검증: hex 문자열을 파싱하여 저장된 토큰과 비교
@@ -218,6 +228,7 @@ mod tests {
         RemoteServer {
             port: 8080,
             auth_token: token,
+            cert_fingerprint: "aa".repeat(32),
             endpoint: test_endpoint(),
         }
     }
@@ -225,21 +236,25 @@ mod tests {
     #[tokio::test]
     async fn emit_parse_roundtrip() {
         let token = AuthToken::generate();
+        let fp_hex = "bb".repeat(32);
         let server = RemoteServer {
             port: 45231,
             auth_token: token.clone(),
+            cert_fingerprint: fp_hex.clone(),
             endpoint: test_endpoint(),
         };
 
         let handshake_line = format!(
-            "QUICSYNC_READY {} {}",
+            "QUICSYNC_READY {} {} {}",
             server.port,
-            server.auth_token.to_hex()
+            server.auth_token.to_hex(),
+            server.cert_fingerprint,
         );
 
-        let (parsed_port, parsed_token) = parse_handshake(&handshake_line).unwrap();
-        assert_eq!(parsed_port, server.port);
-        assert_eq!(parsed_token, server.auth_token.to_hex());
+        let info = parse_handshake(&handshake_line).unwrap();
+        assert_eq!(info.port, server.port);
+        assert_eq!(info.token, server.auth_token.to_hex());
+        assert_eq!(info.fingerprint.as_deref(), Some(fp_hex.as_str()));
     }
 
     #[tokio::test]
@@ -267,5 +282,6 @@ mod tests {
         let server = RemoteServer::start().await.expect("server should start");
         assert!(server.port > 0);
         assert_eq!(server.auth_token.to_hex().len(), 64);
+        assert_eq!(server.cert_fingerprint.len(), 64);
     }
 }

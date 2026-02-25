@@ -1,14 +1,18 @@
 // 전체 세션 생명주기 관리 및 시그널 핸들링
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use tokio::sync::watch;
 
 use crate::buffer::BufferLayer;
 use crate::error::SessionError;
-use crate::quic::{QuicClientCfg, QuicTunnel};
+use crate::metrics::TransferMetrics;
+use crate::progress::ProgressUI;
+use crate::quic::{fingerprint_from_hex, QuicClientCfg, QuicTunnel};
 use crate::rsync::RsyncChild;
 use crate::ssh::launch_remote_server;
+use crate::stats::StatsReporter;
 use crate::tcp_proxy::TcpProxy;
 use crate::types::CliArgs;
 
@@ -18,6 +22,9 @@ pub struct Session {
     tunnel: QuicTunnel,
     rsync: RsyncChild,
     started_at: std::time::Instant,
+    metrics: Arc<TransferMetrics>,
+    show_stats: bool,
+    stats_format: crate::types::StatsFormat,
 }
 
 impl Session {
@@ -31,6 +38,10 @@ impl Session {
     /// 6. Buffer relay 태스크 spawn
     pub async fn start(args: CliArgs) -> Result<Self, SessionError> {
         let started_at = std::time::Instant::now();
+        let metrics = Arc::new(TransferMetrics::new());
+        let show_stats = args.stats;
+        let stats_format = args.stats_format;
+
         let remote_display = match &args.remote.user {
             Some(u) => format!("{}@{}:{}", u, args.remote.host, args.remote.path),
             None => format!("{}:{}", args.remote.host, args.remote.path),
@@ -61,6 +72,13 @@ impl Session {
             .next()
             .ok_or_else(|| SessionError::InitFailed(format!("no address found for {host_port}")))?;
 
+        // 핸드셰이크에서 수신한 지문을 바이트로 변환
+        let fingerprint = match &handshake.fingerprint {
+            Some(hex) => Some(fingerprint_from_hex(hex)
+                .map_err(|e| SessionError::InitFailed(format!("fingerprint: {e}")))?),
+            None => None,
+        };
+
         // 2. QUIC 터널 수립
         tracing::info!("connecting QUIC tunnel to {}...", remote_addr);
         let tunnel = QuicTunnel::connect(QuicClientCfg {
@@ -68,6 +86,7 @@ impl Session {
             auth_token: handshake.auth_token.clone(),
             server_name: "localhost".to_string(),
             window_bytes: args.quic_window,
+            fingerprint,
         })
         .await
         .map_err(|e| SessionError::InitFailed(format!("QUIC: {e}")))?;
@@ -79,7 +98,6 @@ impl Session {
             .map_err(|e| SessionError::InitFailed(format!("QUIC stream: {e}")))?;
 
         // 인증 토큰을 첫 번째 메시지로 전송
-        // rsync 서버 인수는 --connect 모드가 rsh 호출에서 추출하여 TCP 프록시를 통해 전송한다.
         send_stream
             .write_all(format!("{}\n", handshake.auth_token).as_bytes())
             .await
@@ -102,7 +120,16 @@ impl Session {
         )
         .map_err(|e| SessionError::InitFailed(format!("rsync: {e}")))?;
 
-        // 6. Buffer relay 태스크 spawn
+        // 6. Progress UI spawn (show_progress이면)
+        if args.show_progress {
+            let progress = ProgressUI {
+                metrics: metrics.clone(),
+                enabled: true,
+            };
+            tokio::spawn(async move { progress.run().await });
+        }
+
+        // 7. Buffer relay 태스크 spawn
         let buffer = BufferLayer::from_env();
         let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel(1024);
         let (rev_tx, rev_rx) = tokio::sync::mpsc::channel(1024);
@@ -114,17 +141,19 @@ impl Session {
             }
         });
 
-        // Buffer forward relay: 채널 → QUIC SendStream
+        // Buffer forward relay: 채널 → QUIC SendStream (메트릭 연동)
+        let fwd_metrics = Some(metrics.clone());
         tokio::spawn(async move {
-            if let Err(e) = buffer.relay_forward(fwd_rx, send_stream).await {
+            if let Err(e) = buffer.relay_forward(fwd_rx, send_stream, fwd_metrics).await {
                 tracing::error!("forward relay error: {e}");
             }
         });
 
-        // Buffer reverse relay: QUIC RecvStream → 채널
+        // Buffer reverse relay: QUIC RecvStream → 채널 (메트릭 연동)
         let reverse_buffer = BufferLayer::from_env();
+        let rev_metrics = Some(metrics.clone());
         tokio::spawn(async move {
-            if let Err(e) = reverse_buffer.relay_reverse(recv_stream, rev_tx).await {
+            if let Err(e) = reverse_buffer.relay_reverse(recv_stream, rev_tx, rev_metrics).await {
                 tracing::error!("reverse relay error: {e}");
             }
         });
@@ -136,6 +165,9 @@ impl Session {
             tunnel,
             rsync,
             started_at,
+            metrics,
+            show_stats,
+            stats_format,
         })
     }
 
@@ -146,7 +178,10 @@ impl Session {
     pub async fn run(self) -> Result<i32, SessionError> {
         let mut signal_rx = install_signal_handlers()?;
 
-        let Session { mut ssh_process, tunnel, rsync, started_at } = self;
+        let Session {
+            mut ssh_process, tunnel, rsync, started_at,
+            metrics, show_stats, stats_format,
+        } = self;
 
         tokio::select! {
             result = rsync.wait() => {
@@ -166,6 +201,13 @@ impl Session {
                 };
                 shutdown(tunnel, &mut ssh_process).await;
                 let elapsed = started_at.elapsed();
+
+                // 통계 보고
+                if show_stats {
+                    let reporter = StatsReporter { format: stats_format };
+                    reporter.report(&metrics.snapshot());
+                }
+
                 if code == 0 {
                     eprintln!("quicsync: done in {:.2}s", elapsed.as_secs_f64());
                 } else {

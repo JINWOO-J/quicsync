@@ -1,0 +1,13 @@
+# macOS cross-compilation targets
+# quicsync uses only #[cfg(unix)] APIs (libc::fcntl, O_NONBLOCK),
+# which are supported on both Linux and macOS.
+
+[target.aarch64-apple-darwin]
+# Apple Silicon (M1/M2/M3)
+# Requires: rustup target add aarch64-apple-darwin
+# For cross-compile from Linux, also needs macOS SDK
+
+[target.x86_64-apple-darwin]
+# Intel Mac
+# Requires: rustup target add x86_64-apple-darwin
+# For cross-compile from Linux, also needs macOS SDK

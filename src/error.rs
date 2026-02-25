@@ -29,6 +29,21 @@ pub enum QuicsyncError {
 
     #[error("Session error: {0}")]
     Session(#[from] SessionError),
+
+    #[error("Integrity error: {0}")]
+    Integrity(#[from] IntegrityError),
+
+    #[error("Fingerprint error: {0}")]
+    Fingerprint(#[from] FingerprintError),
+
+    #[error("Stats error: {0}")]
+    Stats(#[from] StatsError),
+
+    #[error("Telemetry error: {0}")]
+    Telemetry(#[from] TelemetryError),
+
+    #[error("MultiStream error: {0}")]
+    MultiStream(#[from] MultiStreamError),
 }
 
 /// CLI 인수 파싱 오류
@@ -139,6 +154,59 @@ pub enum SessionError {
 
     #[error("component error: {0}")]
     ComponentError(String),
+}
+
+/// Blake3 무결성 검증 오류
+#[derive(Debug, Error)]
+pub enum IntegrityError {
+    #[error("hash mismatch")]
+    HashMismatch,
+
+    #[error("frame too short: expected at least 32 bytes, got {0}")]
+    FrameTooShort(usize),
+}
+
+/// 인증서 지문 검증 오류
+#[derive(Debug, Error)]
+pub enum FingerprintError {
+    #[error("invalid hex string: {0}")]
+    InvalidHex(String),
+
+    #[error("invalid fingerprint length: expected 32 bytes, got {0}")]
+    InvalidLength(usize),
+
+    #[error("fingerprint mismatch")]
+    Mismatch,
+}
+
+/// 통계 보고 오류
+#[derive(Debug, Error)]
+pub enum StatsError {
+    #[error("serialization failed: {0}")]
+    SerializationFailed(String),
+
+    #[error("deserialization failed: {0}")]
+    DeserializationFailed(String),
+}
+
+/// 텔레메트리 오류
+#[derive(Debug, Error)]
+pub enum TelemetryError {
+    #[error("telemetry init failed: {0}")]
+    InitFailed(String),
+
+    #[error("telemetry export failed: {0}")]
+    ExportFailed(String),
+}
+
+/// 멀티스트림 오류
+#[derive(Debug, Error)]
+pub enum MultiStreamError {
+    #[error("stream failed: {0}")]
+    StreamFailed(String),
+
+    #[error("invalid stream count: {0}")]
+    InvalidStreamCount(String),
 }
 
 /// AuthToken 파싱 오류

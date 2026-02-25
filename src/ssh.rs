@@ -59,11 +59,12 @@ pub async fn launch_remote_server(
         Ok(Ok(_)) => {} // 정상 읽기 완료
     }
 
-    let (port, token) = parse_handshake(&line)?;
+    let info = parse_handshake(&line)?;
 
     Ok(SshHandshake {
-        remote_port: port,
-        auth_token: token,
+        remote_port: info.port,
+        auth_token: info.token,
+        fingerprint: info.fingerprint,
         ssh_process: child,
     })
 }
@@ -87,18 +88,28 @@ async fn read_stderr(mut stderr: tokio::process::ChildStderr) -> String {
     }
 }
 
+/// 핸드셰이크 파싱 결과
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandshakeInfo {
+    pub port: u16,
+    pub token: String,
+    pub fingerprint: Option<String>,
+}
+
 /// SSH stdout에서 핸드셰이크 라인을 파싱한다.
 ///
-/// 형식: `QUICSYNC_READY <port> <token>\n`
+/// 형식 (3-part, 하위 호환): `QUICSYNC_READY <port> <token>\n`
+/// 형식 (4-part, 지문 포함): `QUICSYNC_READY <port> <token> <fingerprint>\n`
 /// - port: 1–65535 범위의 UDP 포트 번호
 /// - token: 64자 hex 인코딩된 인증 토큰
-pub fn parse_handshake(stdout_line: &str) -> Result<(u16, String), SshError> {
+/// - fingerprint: 64자 hex 인코딩된 인증서 SHA-256 지문 (선택)
+pub fn parse_handshake(stdout_line: &str) -> Result<HandshakeInfo, SshError> {
     let line = stdout_line.trim();
     let parts: Vec<&str> = line.split_whitespace().collect();
 
-    if parts.len() != 3 {
+    if parts.len() != 3 && parts.len() != 4 {
         return Err(SshError::HandshakeParseFailed(format!(
-            "expected 3 parts (QUICSYNC_READY <port> <token>), got {}",
+            "expected 3 or 4 parts (QUICSYNC_READY <port> <token> [fingerprint]), got {}",
             parts.len()
         )));
     }
@@ -134,7 +145,29 @@ pub fn parse_handshake(stdout_line: &str) -> Result<(u16, String), SshError> {
         ));
     }
 
-    Ok((port, token.to_string()))
+    let fingerprint = if parts.len() == 4 {
+        let fp = parts[3];
+        if fp.len() != 64 {
+            return Err(SshError::HandshakeParseFailed(format!(
+                "fingerprint must be 64 hex chars, got {} chars",
+                fp.len()
+            )));
+        }
+        if !fp.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(SshError::HandshakeParseFailed(
+                "fingerprint contains non-hex characters".to_string(),
+            ));
+        }
+        Some(fp.to_string())
+    } else {
+        None
+    };
+
+    Ok(HandshakeInfo {
+        port,
+        token: token.to_string(),
+        fingerprint,
+    })
 }
 
 #[cfg(test)]
@@ -147,17 +180,29 @@ mod tests {
     fn parse_valid_handshake() {
         let token = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
         let line = format!("QUICSYNC_READY 45231 {}", token);
-        let (port, parsed_token) = parse_handshake(&line).unwrap();
-        assert_eq!(port, 45231);
-        assert_eq!(parsed_token, token);
+        let info = parse_handshake(&line).unwrap();
+        assert_eq!(info.port, 45231);
+        assert_eq!(info.token, token);
+        assert_eq!(info.fingerprint, None);
     }
 
     #[test]
     fn parse_handshake_with_trailing_newline() {
         let token = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
         let line = format!("QUICSYNC_READY 8080 {}\n", token);
-        let (port, _) = parse_handshake(&line).unwrap();
-        assert_eq!(port, 8080);
+        let info = parse_handshake(&line).unwrap();
+        assert_eq!(info.port, 8080);
+    }
+
+    #[test]
+    fn parse_handshake_4_part_with_fingerprint() {
+        let token = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let fp = "ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00";
+        let line = format!("QUICSYNC_READY 9090 {} {}", token, fp);
+        let info = parse_handshake(&line).unwrap();
+        assert_eq!(info.port, 9090);
+        assert_eq!(info.token, token);
+        assert_eq!(info.fingerprint.as_deref(), Some(fp));
     }
 
     #[test]
@@ -207,23 +252,56 @@ mod tests {
         let result = parse_handshake("QUICSYNC_READY 8080");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("expected 3 parts"));
+        assert!(err.contains("expected 3 or 4 parts"));
     }
 
     #[test]
     fn parse_handshake_too_many_parts() {
         let token = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-        let result = parse_handshake(&format!("QUICSYNC_READY 8080 {} extra", token));
+        let fp = "ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00";
+        let result = parse_handshake(&format!("QUICSYNC_READY 8080 {} {} extra", token, fp));
         assert!(result.is_err());
     }
 
     // Feature: quicsync-tunnel-mvp, Property 3: 핸드셰이크 프로토콜 라운드트립
     // **Validates: Requirements 2.2**
 
+    // --- classify_ssh_error 테스트 ---
+
+    #[test]
+    fn classify_not_found() {
+        let err = classify_ssh_error("bash: quicsync: command not found");
+        assert!(matches!(err, SshError::BinaryNotFound(_)));
+    }
+
+    #[test]
+    fn classify_no_such_file() {
+        let err = classify_ssh_error("No such file or directory");
+        assert!(matches!(err, SshError::BinaryNotFound(_)));
+    }
+
+    #[test]
+    fn classify_generic_error() {
+        let err = classify_ssh_error("Connection refused");
+        assert!(matches!(err, SshError::ConnectionFailed(_)));
+    }
+
+    #[test]
+    fn classify_empty_string() {
+        let err = classify_ssh_error("");
+        assert!(matches!(err, SshError::ConnectionFailed(_)));
+    }
+
+    #[test]
+    fn classify_mixed_case_not_found() {
+        let err = classify_ssh_error("ERROR: Not Found on remote host");
+        assert!(matches!(err, SshError::BinaryNotFound(_)));
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
-        /// 임의의 유효 포트(1–65535)와 32바이트 토큰으로 핸드셰이크 문자열을 구성한 뒤
+        /// 3-part: 임의의 유효 포트(1–65535)와 32바이트 토큰으로 핸드셰이크 문자열을 구성한 뒤
         /// parse_handshake로 파싱하면 원래 포트와 토큰이 복원되어야 한다.
         #[test]
         fn handshake_roundtrip(
@@ -233,15 +311,35 @@ mod tests {
             let token = AuthToken::from_raw(token_bytes);
             let token_hex = token.to_hex();
 
-            // emit_handshake와 동일한 형식으로 직렬화
             let handshake_line = format!("QUICSYNC_READY {} {}", port, token_hex);
 
-            // parse_handshake로 역직렬화
-            let (parsed_port, parsed_token) = parse_handshake(&handshake_line)
+            let info = parse_handshake(&handshake_line)
                 .expect("valid handshake should parse");
 
-            prop_assert_eq!(parsed_port, port);
-            prop_assert_eq!(parsed_token, token_hex);
+            prop_assert_eq!(info.port, port);
+            prop_assert_eq!(info.token, token_hex);
+            prop_assert_eq!(info.fingerprint, None);
+        }
+
+        /// 4-part: 지문 포함 핸드셰이크 라운드트립 (Property 6)
+        #[test]
+        fn handshake_roundtrip_with_fingerprint(
+            port in 1u16..=65535,
+            token_bytes in prop::array::uniform32(any::<u8>()),
+            fp_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let token = AuthToken::from_raw(token_bytes);
+            let token_hex = token.to_hex();
+            let fp_hex = hex::encode(fp_bytes);
+
+            let handshake_line = format!("QUICSYNC_READY {} {} {}", port, token_hex, fp_hex);
+
+            let info = parse_handshake(&handshake_line)
+                .expect("valid 4-part handshake should parse");
+
+            prop_assert_eq!(info.port, port);
+            prop_assert_eq!(info.token, token_hex);
+            prop_assert_eq!(info.fingerprint, Some(fp_hex));
         }
     }
 }

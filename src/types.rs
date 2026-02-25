@@ -5,6 +5,8 @@ use tokio::process::Child;
 
 use ring::rand::SecureRandom;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::TokenError;
 
 /// 원격 경로 파싱 결과 (`user@host:path`)
@@ -13,6 +15,13 @@ pub struct RemoteSpec {
     pub user: Option<String>,
     pub host: String,
     pub path: String,
+}
+
+/// 통계 출력 형식
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StatsFormat {
+    Text,
+    Json,
 }
 
 /// 전송 방향
@@ -33,6 +42,18 @@ pub struct CliArgs {
     pub direction: TransferDirection,
     /// QUIC 윈도우 크기 (바이트). --window 옵션 또는 QUICSYNC_WINDOW 환경변수로 설정.
     pub quic_window: u64,
+    /// 진행률 UI 표시 여부 (기본: TTY이면 true)
+    pub show_progress: bool,
+    /// 동시 QUIC 스트림 수 (1-64, 기본: 1)
+    pub streams: u16,
+    /// 전송 완료 후 통계 표시 여부
+    pub stats: bool,
+    /// 통계 출력 형식
+    pub stats_format: StatsFormat,
+    /// OpenTelemetry OTLP 엔드포인트 URL
+    pub otel_endpoint: Option<String>,
+    /// Blake3 무결성 검증 비활성화
+    pub no_integrity: bool,
 }
 
 /// 32바이트 랜덤 인증 토큰 (hex 인코딩 시 64자)
@@ -102,6 +123,7 @@ impl Eq for AuthToken {}
 pub struct SshHandshake {
     pub remote_port: u16,
     pub auth_token: String,
+    pub fingerprint: Option<String>,
     pub ssh_process: Child,
 }
 
@@ -109,6 +131,80 @@ pub struct SshHandshake {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // --- AuthToken 단위 테스트 ---
+
+    #[test]
+    fn auth_token_generate_is_unique() {
+        let t1 = AuthToken::generate();
+        let t2 = AuthToken::generate();
+        assert_ne!(t1.as_bytes(), t2.as_bytes());
+    }
+
+    #[test]
+    fn auth_token_hex_length_is_64() {
+        let token = AuthToken::generate();
+        assert_eq!(token.to_hex().len(), 64);
+    }
+
+    #[test]
+    fn auth_token_from_hex_invalid_chars() {
+        let result = AuthToken::from_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn auth_token_from_hex_too_short() {
+        let result = AuthToken::from_hex("aabbccdd");
+        assert!(matches!(result, Err(TokenError::InvalidLength(4))));
+    }
+
+    #[test]
+    fn auth_token_from_hex_too_long() {
+        // 66 hex chars = 33 bytes
+        let long_hex = "aa".repeat(33);
+        let result = AuthToken::from_hex(&long_hex);
+        assert!(matches!(result, Err(TokenError::InvalidLength(33))));
+    }
+
+    #[test]
+    fn auth_token_from_hex_empty() {
+        let result = AuthToken::from_hex("");
+        assert!(matches!(result, Err(TokenError::InvalidLength(0))));
+    }
+
+    #[test]
+    fn auth_token_from_hex_odd_length() {
+        let result = AuthToken::from_hex("abc");
+        assert!(matches!(result, Err(TokenError::InvalidHex(_))));
+    }
+
+    #[test]
+    fn auth_token_debug_redacted() {
+        let token = AuthToken::generate();
+        let debug_str = format!("{:?}", token);
+        assert!(debug_str.contains("REDACTED"));
+        // 실제 토큰 바이트가 노출되지 않아야 함
+        assert!(!debug_str.contains(&token.to_hex()));
+    }
+
+    #[test]
+    fn auth_token_from_raw_and_as_bytes() {
+        let bytes = [42u8; 32];
+        let token = AuthToken::from_raw(bytes);
+        assert_eq!(token.as_bytes(), &bytes);
+    }
+
+    #[test]
+    fn auth_token_eq_impl_uses_verify() {
+        let bytes = [0xABu8; 32];
+        let t1 = AuthToken::from_raw(bytes);
+        let t2 = AuthToken::from_raw(bytes);
+        assert_eq!(t1, t2);
+
+        let t3 = AuthToken::from_raw([0xCDu8; 32]);
+        assert_ne!(t1, t3);
+    }
 
     // Feature: quicsync-tunnel-mvp, Property 8: 인증 토큰 검증
     // **Validates: Requirements 6.2, 6.3**

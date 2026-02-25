@@ -107,9 +107,15 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
         ));
     }
 
-    // --window 옵션을 먼저 추출한다 (quicsync 자체 옵션).
+    // quicsync 자체 옵션을 먼저 추출한다.
     // 나머지는 rsync 옵션 + positional로 분류한다.
     let mut window_mb: Option<u64> = None;
+    let mut no_progress = false;
+    let mut streams: Option<u16> = None;
+    let mut stats = false;
+    let mut stats_format: Option<crate::types::StatsFormat> = None;
+    let mut otel_endpoint: Option<String> = None;
+    let mut no_integrity = false;
     let mut remaining: Vec<&str> = Vec::new();
     let mut iter = trailing.iter();
     while let Some(arg) = iter.next() {
@@ -119,6 +125,46 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
             }
         } else if let Some(val) = arg.strip_prefix("--window=") {
             window_mb = val.parse().ok();
+        } else if arg.as_str() == "--no-progress" {
+            no_progress = true;
+        } else if arg.as_str() == "--streams" {
+            if let Some(val) = iter.next() {
+                let n: u16 = val.parse().map_err(|_| {
+                    CliError::InvalidArgs(format!("invalid --streams value: '{val}'"))
+                })?;
+                if n < 1 || n > 64 {
+                    return Err(CliError::InvalidArgs(format!(
+                        "--streams must be 1-64, got {n}"
+                    )));
+                }
+                streams = Some(n);
+            }
+        } else if let Some(val) = arg.strip_prefix("--streams=") {
+            let n: u16 = val.parse().map_err(|_| {
+                CliError::InvalidArgs(format!("invalid --streams value: '{val}'"))
+            })?;
+            if n < 1 || n > 64 {
+                return Err(CliError::InvalidArgs(format!(
+                    "--streams must be 1-64, got {n}"
+                )));
+            }
+            streams = Some(n);
+        } else if arg.as_str() == "--stats" {
+            stats = true;
+        } else if arg.as_str() == "--stats-format" {
+            if let Some(val) = iter.next() {
+                stats_format = Some(parse_stats_format(val)?);
+            }
+        } else if let Some(val) = arg.strip_prefix("--stats-format=") {
+            stats_format = Some(parse_stats_format(val)?);
+        } else if arg.as_str() == "--otel-endpoint" {
+            if let Some(val) = iter.next() {
+                otel_endpoint = Some(val.to_string());
+            }
+        } else if let Some(val) = arg.strip_prefix("--otel-endpoint=") {
+            otel_endpoint = Some(val.to_string());
+        } else if arg.as_str() == "--no-integrity" {
+            no_integrity = true;
         } else {
             remaining.push(arg.as_str());
         }
@@ -127,6 +173,9 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
     let quic_window = window_mb
         .map(|mb| mb * 1024 * 1024)
         .unwrap_or_else(window_bytes_from_env);
+    let show_progress = !no_progress && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let final_streams = streams.unwrap_or(1);
+    let final_stats_format = stats_format.unwrap_or(crate::types::StatsFormat::Text);
 
     // trailing args를 rsync 옵션과 경로(positional)로 분리한다.
     // `-`로 시작하는 인수는 rsync 옵션, 나머지는 경로로 취급한다.
@@ -177,6 +226,12 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
             rsync_options,
             direction: TransferDirection::Push,
             quic_window,
+            show_progress,
+            streams: final_streams,
+            stats,
+            stats_format: final_stats_format,
+            otel_endpoint: otel_endpoint.clone(),
+            no_integrity,
         })
     } else {
         // Pull: SRC 중 하나가 원격, DST가 로컬
@@ -197,7 +252,24 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
             rsync_options,
             direction: TransferDirection::Pull,
             quic_window,
+            show_progress,
+            streams: final_streams,
+            stats,
+            stats_format: final_stats_format,
+            otel_endpoint,
+            no_integrity,
         })
+    }
+}
+
+/// --stats-format 값 파싱
+fn parse_stats_format(val: &str) -> Result<crate::types::StatsFormat, CliError> {
+    match val {
+        "text" => Ok(crate::types::StatsFormat::Text),
+        "json" => Ok(crate::types::StatsFormat::Json),
+        _ => Err(CliError::InvalidArgs(format!(
+            "invalid --stats-format: '{val}' (expected 'text' or 'json')"
+        ))),
     }
 }
 
@@ -205,6 +277,50 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // --- is_remote 테스트 ---
+
+    #[test]
+    fn is_remote_user_host_path() {
+        assert!(is_remote("user@host:/path"));
+    }
+
+    #[test]
+    fn is_remote_host_path() {
+        assert!(is_remote("host:/path"));
+    }
+
+    #[test]
+    fn is_remote_host_empty_path() {
+        assert!(is_remote("host:"));
+    }
+
+    #[test]
+    fn is_remote_absolute_path_not_remote() {
+        assert!(!is_remote("/local/path"));
+    }
+
+    #[test]
+    fn is_remote_relative_dot_path_not_remote() {
+        assert!(!is_remote("./relative/path"));
+    }
+
+    #[test]
+    fn is_remote_relative_dotdot_not_remote() {
+        // ../path는 '.'로 시작하므로 로컬
+        assert!(!is_remote("../parent/path"));
+    }
+
+    #[test]
+    fn is_remote_plain_name_without_colon_not_remote() {
+        assert!(!is_remote("justahostname"));
+    }
+
+    #[test]
+    fn is_remote_colon_in_absolute_path_not_remote() {
+        // /path:with:colons → '/'로 시작하므로 로컬
+        assert!(!is_remote("/path:with:colons"));
+    }
 
     // --- parse_remote 단위 테스트 ---
 
@@ -540,6 +656,115 @@ mod tests {
             prop_assert_eq!(&cli.remote.path, &remote_path);
             prop_assert_eq!(&cli.rsync_options, &rsync_opts);
             prop_assert_eq!(cli.direction, TransferDirection::Pull);
+        }
+    }
+
+    // --- Phase 2 CLI 플래그 테스트 ---
+
+    #[test]
+    fn parse_args_no_progress_flag() {
+        let a = args(&["quicsync", "--no-progress", "/src", "host:/dst"]);
+        let cli = parse_args(&a).unwrap();
+        assert!(!cli.show_progress);
+    }
+
+    #[test]
+    fn parse_args_streams_flag() {
+        let a = args(&["quicsync", "--streams", "4", "/src", "host:/dst"]);
+        let cli = parse_args(&a).unwrap();
+        assert_eq!(cli.streams, 4);
+    }
+
+    #[test]
+    fn parse_args_streams_equals_form() {
+        let a = args(&["quicsync", "--streams=8", "/src", "host:/dst"]);
+        let cli = parse_args(&a).unwrap();
+        assert_eq!(cli.streams, 8);
+    }
+
+    #[test]
+    fn parse_args_streams_zero_rejected() {
+        let a = args(&["quicsync", "--streams", "0", "/src", "host:/dst"]);
+        assert!(matches!(parse_args(&a), Err(CliError::InvalidArgs(_))));
+    }
+
+    #[test]
+    fn parse_args_streams_65_rejected() {
+        let a = args(&["quicsync", "--streams", "65", "/src", "host:/dst"]);
+        assert!(matches!(parse_args(&a), Err(CliError::InvalidArgs(_))));
+    }
+
+    #[test]
+    fn parse_args_streams_64_accepted() {
+        let a = args(&["quicsync", "--streams", "64", "/src", "host:/dst"]);
+        let cli = parse_args(&a).unwrap();
+        assert_eq!(cli.streams, 64);
+    }
+
+    #[test]
+    fn parse_args_stats_flag() {
+        let a = args(&["quicsync", "--stats", "/src", "host:/dst"]);
+        let cli = parse_args(&a).unwrap();
+        assert!(cli.stats);
+    }
+
+    #[test]
+    fn parse_args_stats_format_json() {
+        let a = args(&["quicsync", "--stats-format", "json", "/src", "host:/dst"]);
+        let cli = parse_args(&a).unwrap();
+        assert_eq!(cli.stats_format, crate::types::StatsFormat::Json);
+    }
+
+    #[test]
+    fn parse_args_stats_format_equals_json() {
+        let a = args(&["quicsync", "--stats-format=json", "/src", "host:/dst"]);
+        let cli = parse_args(&a).unwrap();
+        assert_eq!(cli.stats_format, crate::types::StatsFormat::Json);
+    }
+
+    #[test]
+    fn parse_args_stats_format_invalid() {
+        let a = args(&["quicsync", "--stats-format", "xml", "/src", "host:/dst"]);
+        assert!(matches!(parse_args(&a), Err(CliError::InvalidArgs(_))));
+    }
+
+    #[test]
+    fn parse_args_otel_endpoint() {
+        let a = args(&["quicsync", "--otel-endpoint", "http://localhost:4317", "/src", "host:/dst"]);
+        let cli = parse_args(&a).unwrap();
+        assert_eq!(cli.otel_endpoint.as_deref(), Some("http://localhost:4317"));
+    }
+
+    #[test]
+    fn parse_args_no_integrity() {
+        let a = args(&["quicsync", "--no-integrity", "/src", "host:/dst"]);
+        let cli = parse_args(&a).unwrap();
+        assert!(cli.no_integrity);
+    }
+
+    #[test]
+    fn parse_args_default_streams_is_1() {
+        let a = args(&["quicsync", "/src", "host:/dst"]);
+        let cli = parse_args(&a).unwrap();
+        assert_eq!(cli.streams, 1);
+    }
+
+    // Property 2: --streams 범위 검증
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn prop_streams_valid_range(n in 1u16..=64) {
+            let a = args(&["quicsync", "--streams", &n.to_string(), "/src", "host:/dst"]);
+            let cli = parse_args(&a).unwrap();
+            prop_assert_eq!(cli.streams, n);
+        }
+
+        #[test]
+        fn prop_streams_out_of_range_rejected(n in 65u16..=1000) {
+            let a = args(&["quicsync", "--streams", &n.to_string(), "/src", "host:/dst"]);
+            let result = parse_args(&a);
+            prop_assert!(matches!(result, Err(CliError::InvalidArgs(_))));
         }
     }
 }
