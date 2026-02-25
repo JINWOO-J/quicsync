@@ -31,6 +31,8 @@ pub struct CliArgs {
     pub remote: RemoteSpec,
     pub rsync_options: Vec<String>,
     pub direction: TransferDirection,
+    /// QUIC 윈도우 크기 (바이트). --window 옵션 또는 QUICSYNC_WINDOW 환경변수로 설정.
+    pub quic_window: u64,
 }
 
 /// 32바이트 랜덤 인증 토큰 (hex 인코딩 시 64자)

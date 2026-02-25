@@ -32,7 +32,7 @@ impl RemoteServer {
             .map_err(|e| ServerError::StartFailed(format!("TLS config: {e}")))?;
 
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let endpoint = build_server_endpoint(bind_addr, tls_config)
+        let endpoint = build_server_endpoint(bind_addr, tls_config, crate::quic::window_bytes_from_env())
             .map_err(|e| ServerError::StartFailed(format!("endpoint: {e}")))?;
 
         let port = endpoint
@@ -148,13 +148,12 @@ impl RemoteServer {
 
         // 6. 양방향 중계: QUIC recv → rsync stdin, rsync stdout → QUIC send
         //
-        // tokio::join! 대신 rsync 프로세스 종료를 기준으로 정리한다.
+        // rsync_to_quic (stdout→QUIC) 완료를 기준으로 세션을 정리한다.
+        // rsync stdout EOF = rsync가 보낼 데이터를 모두 보냄 → finish() 호출.
         //
-        // join!을 사용하면 데드락이 발생할 수 있다:
-        //   서버: quic_to_rsync가 QUIC recv EOF 대기 → 클라이언트 send finish 필요
-        //   클라이언트: --connect rev 완료 대기 → 서버 send finish 필요 → join! 완료 필요
-        //
-        // rsync 프로세스가 종료되면 양방향 모두 정리해야 한다.
+        // quic_to_rsync (QUIC→stdin)는 클라이언트 finish()에 의존하는데,
+        // 클라이언트는 서버 finish()를 기다리므로 순환 대기가 발생한다.
+        // 따라서 rsync_to_quic 완료 후 quic_to_rsync를 abort한다.
         let quic_to_rsync = tokio::spawn(async move {
             let r = tokio::io::copy(&mut reader, &mut child_stdin).await;
             let _ = child_stdin.shutdown().await;
@@ -170,23 +169,16 @@ impl RemoteServer {
             r
         });
 
-        // 7. rsync 종료 대기 — relay 태스크와 동시에 실행
+        // rsync stdout EOF → finish() 완료를 기다린다.
+        // 이후 quic_to_rsync를 abort하여 순환 대기를 끊는다.
+        let _ = rsync_to_quic.await;
+        quic_to_rsync.abort();
+
+        // 7. rsync 종료 대기
         let status = child
             .wait()
             .await
             .map_err(|e| ServerError::RelayError(format!("wait: {e}")))?;
-
-        // rsync가 종료되면 stdout은 EOF가 되므로 rsync_to_quic는 곧 완료된다.
-        // quic_to_rsync는 클라이언트가 finish()를 보내지 않으면 영원히 대기할 수 있으므로
-        // 타임아웃으로 정리한다.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            rsync_to_quic,
-        ).await;
-
-        // quic_to_rsync는 rsync stdin이 닫혔으므로 copy가 에러/EOF로 끝나거나,
-        // 아직 QUIC 데이터를 기다리고 있을 수 있다. abort로 정리.
-        quic_to_rsync.abort();
 
         // 클라이언트가 모든 데이터를 수신한 후 연결을 닫을 때까지 대기.
         // send_stream.finish() 직후 endpoint.close()를 호출하면
@@ -219,7 +211,7 @@ mod tests {
             .with_no_client_auth()
             .with_single_cert(vec![cert], key)
             .unwrap();
-        build_server_endpoint(addr, tls).unwrap()
+        build_server_endpoint(addr, tls, 64 * 1024 * 1024).unwrap()
     }
 
     fn test_server(token: AuthToken) -> RemoteServer {

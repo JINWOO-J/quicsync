@@ -32,17 +32,45 @@ docker exec qs-client true 2>/dev/null || { echo "오류: qs-client 컨테이너
 echo "테스트 데이터 생성..."
 docker exec qs-client bash -c "dd if=/dev/urandom of=/tmp/bench/test.bin bs=1M count=$DATA_MB 2>/dev/null"
 
-# ── 지연 설정 ─────────────────────────────────────────
+# ── 지연 설정 (pumba) ─────────────────────────────────
+# pumba로 양방향 지연을 주입한다.
+# client→server, server→client 모두에 delay를 걸어야 실제 WAN RTT를 재현할 수 있다.
+# pumba는 helper container로 타겟의 네트워크 네임스페이스에 tc netem을 주입한다.
+PUMBA_IMAGE="ghcr.io/alexei-led/pumba:latest"
+
+clear_delay() {
+    # 기존 pumba 프로세스 종료 (pumba가 tc 규칙을 자동 정리)
+    docker ps -q --filter "ancestor=$PUMBA_IMAGE" | xargs -r docker rm -f 2>/dev/null || true
+    sleep 2
+    # pumba 정리가 불완전할 수 있으므로 양쪽 모두 직접 제거
+    docker exec qs-client tc qdisc del dev eth0 root 2>/dev/null || true
+    docker exec qs-server tc qdisc del dev eth0 root 2>/dev/null || true
+}
+
 set_delay() {
     local ms="$1"
-    # 기존 qdisc 제거
-    docker exec qs-client tc qdisc del dev eth0 root 2>/dev/null || true
+    clear_delay
+    sleep 1
     if [[ "$ms" -gt 0 ]]; then
-        docker exec qs-client tc qdisc add dev eth0 root netem delay "${ms}ms"
+        # client에 지연 (client→server 방향)
+        docker run -d --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            "$PUMBA_IMAGE" \
+            netem --duration 30m --interface eth0 \
+            delay --time "$ms" --jitter 0 \
+            qs-client >/dev/null 2>&1
+        # server에 지연 (server→client 방향)
+        docker run -d --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            "$PUMBA_IMAGE" \
+            netem --duration 30m --interface eth0 \
+            delay --time "$ms" --jitter 0 \
+            qs-server >/dev/null 2>&1
+        sleep 2  # pumba가 tc 규칙을 적용할 시간
     fi
     # RTT 확인
     local rtt
-    rtt=$(docker exec qs-client ping -c 1 -W 2 172.30.0.10 2>/dev/null | grep 'time=' | grep -o 'time=[0-9.]*' | cut -d= -f2 || echo "?")
+    rtt=$(docker exec qs-client ping -c 2 -W 2 172.30.0.10 2>/dev/null | grep 'time=' | tail -1 | grep -o 'time=[0-9.]*' | cut -d= -f2 || echo "?")
     echo "   지연 ${ms}ms 설정 (측정 RTT: ${rtt}ms)"
 }
 
@@ -59,7 +87,7 @@ run_one() {
         rsync_ssh)
             wall_sec=$(docker exec qs-client bash -c "
                 START=\$(date +%s.%N)
-                rsync -a /tmp/bench/test.bin $SERVER:$remote_dir/ 2>/dev/null
+                rsync -a /tmp/bench/test.bin $SERVER:$remote_dir/ >/dev/null 2>&1
                 END=\$(date +%s.%N)
                 echo \"\$END - \$START\" | bc -l
             ")
@@ -67,7 +95,7 @@ run_one() {
         quicsync)
             wall_sec=$(docker exec qs-client bash -c "
                 START=\$(date +%s.%N)
-                quicsync -a /tmp/bench/test.bin $SERVER:$remote_dir/ 2>/dev/null
+                quicsync -a /tmp/bench/test.bin $SERVER:$remote_dir/ >/dev/null 2>&1
                 END=\$(date +%s.%N)
                 echo \"\$END - \$START\" | bc -l
             ")
@@ -106,7 +134,7 @@ for delay in "${DELAYS[@]}"; do
 done
 
 # 지연 제거
-docker exec qs-client tc qdisc del dev eth0 root 2>/dev/null || true
+clear_delay
 
 echo ""
 echo "=== 결과: $CSV ==="

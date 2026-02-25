@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use clap::{Arg, Command};
 
 use crate::error::CliError;
+use crate::quic::window_bytes_from_env;
 use crate::types::{CliArgs, RemoteSpec, TransferDirection};
 
 /// 경로가 원격 경로인지 판별한다.
@@ -76,7 +77,8 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
              quicsync /local/dir user@remote:/remote/dir    # Push\n  \
              quicsync user@remote:/remote/dir /local/dir    # Pull\n  \
              quicsync -avz --delete /src user@host:/dst     # With rsync options\n  \
-             quicsync ./* user@host:/dst                    # Multiple sources",
+             quicsync ./* user@host:/dst                    # Multiple sources\n  \
+             quicsync --window 128 /src user@host:/dst      # 128MB QUIC window",
         )
         .arg(
             Arg::new("args")
@@ -105,15 +107,36 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
         ));
     }
 
+    // --window 옵션을 먼저 추출한다 (quicsync 자체 옵션).
+    // 나머지는 rsync 옵션 + positional로 분류한다.
+    let mut window_mb: Option<u64> = None;
+    let mut remaining: Vec<&str> = Vec::new();
+    let mut iter = trailing.iter();
+    while let Some(arg) = iter.next() {
+        if arg.as_str() == "--window" {
+            if let Some(val) = iter.next() {
+                window_mb = val.parse().ok();
+            }
+        } else if let Some(val) = arg.strip_prefix("--window=") {
+            window_mb = val.parse().ok();
+        } else {
+            remaining.push(arg.as_str());
+        }
+    }
+
+    let quic_window = window_mb
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or_else(window_bytes_from_env);
+
     // trailing args를 rsync 옵션과 경로(positional)로 분리한다.
     // `-`로 시작하는 인수는 rsync 옵션, 나머지는 경로로 취급한다.
     let mut rsync_options = Vec::new();
     let mut positionals = Vec::new();
-    for arg in &trailing {
+    for arg in &remaining {
         if arg.starts_with('-') {
             rsync_options.push(arg.to_string());
         } else {
-            positionals.push(arg.as_str());
+            positionals.push(*arg);
         }
     }
 
@@ -153,6 +176,7 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
             remote,
             rsync_options,
             direction: TransferDirection::Push,
+            quic_window,
         })
     } else {
         // Pull: SRC 중 하나가 원격, DST가 로컬
@@ -172,6 +196,7 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
             remote,
             rsync_options,
             direction: TransferDirection::Pull,
+            quic_window,
         })
     }
 }

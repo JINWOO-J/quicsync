@@ -70,36 +70,32 @@ quicsync -avz --delete --exclude='*.tmp' /src user@server:/dst
 
 ## 벤치마크
 
-RTT가 높은 네트워크에서 quicsync의 성능 이점을 측정한 결과다. `tc netem delay 50ms`로 RTT 100ms를 시뮬레이션했다.
+Docker 컨테이너 간 pumba(tc netem)로 양방향 지연을 주입하여 측정한 결과다. 128MB 단일 파일, 3라운드 평균.
 
-### RTT 100ms 환경 (장거리 네트워크 시뮬레이션)
+### RTT별 성능 비교
 
-| 시나리오 | rsync+ssh | quicsync | 개선 |
-|---|---|---|---|
-| 256MB 단일 파일 | 24.5s (10.5 MB/s) | 14.6s (17.5 MB/s) | **1.68x 빠름** |
-| 1000개 × 100KB | 10.2s (9.6 MB/s) | 6.5s (15.1 MB/s) | **1.57x 빠름** |
-| 혼합 (96MB+소파일) | 9.1s (12.8 MB/s) | 6.1s (16.1 MB/s) | **1.49x 빠름** |
-| 증분 (초기 전송) | 8.7s (11.3 MB/s) | 6.0s (16.5 MB/s) | **1.46x 빠름** |
+| RTT | rsync+ssh | quicsync | 배수 |
+|-----|-----------|----------|------|
+| 0ms | 0.96s (156 MB/s) | 0.99s (147 MB/s) | 0.97x |
+| 50ms | 11.14s (12.4 MB/s) | 3.03s (43.0 MB/s) | **3.67x** |
+| 100ms | 22.05s (6.1 MB/s) | 5.09s (25.2 MB/s) | **4.33x** |
+| 200ms | 63.24s (2.2 MB/s) | 9.31s (13.7 MB/s) | **6.79x** |
+| 500ms | 106.14s (1.3 MB/s) | 20.51s (6.2 MB/s) | **5.18x** |
 
-### LAN 환경 (RTT < 1ms)
-
-| 시나리오 | rsync+ssh | quicsync | 비고 |
-|---|---|---|---|
-| 256MB 단일 파일 | 4.4s (57.8 MB/s) | 5.3s (48.8 MB/s) | rsync+ssh가 빠름 |
-| 1000개 × 100KB | 1.9s (51.2 MB/s) | 2.2s (45.2 MB/s) | rsync+ssh가 빠름 |
-
-LAN에서는 TCP 윈도우 크기 제한이 병목이 아니므로 rsync+ssh가 더 빠르다. QUIC의 userspace 처리 + TLS 오버헤드가 추가되기 때문이다. RTT가 높아질수록 TCP throughput은 `window_size / RTT`로 급격히 떨어지지만, QUIC(BBR)은 완만하게 유지된다.
+LAN(RTT 0ms)에서는 QUIC userspace 오버헤드로 rsync+ssh와 동등하다. RTT가 높아질수록 TCP의 `throughput ≈ window_size / RTT` 제한이 심해지는 반면, QUIC(BBR) + 64MB 윈도우는 대역폭을 훨씬 효율적으로 활용한다.
 
 ### 벤치마크 실행
 
 ```bash
-brew install gnu-time  # gtime 필요
-./bench/run.sh user@host:/remote/path 3
+# Docker 기반 latency sweep (pumba 사용)
+docker compose -f bench/docker/compose.yml up -d --build
+bash bench/docker/setup_ssh.sh
+bash bench/docker/run_latency_sweep.sh 3
+docker compose -f bench/docker/compose.yml down
 
-# RTT 시뮬레이션 (원격 서버가 Linux인 경우)
-ssh user@host 'tc qdisc add dev eth0 root netem delay 50ms'
+# 실서버 벤치마크 (gtime 필요)
+brew install gnu-time
 ./bench/run.sh user@host:/remote/path 3
-ssh user@host 'tc qdisc del dev eth0 root'
 ```
 
 ## 환경변수
@@ -107,9 +103,16 @@ ssh user@host 'tc qdisc del dev eth0 root'
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
 | `QUICSYNC_BUFFER_SIZE` | `268435456` (256MB) | Ring Buffer 크기 (바이트) |
+| `QUICSYNC_WINDOW` | `64` | QUIC 윈도우 크기 (MB). 높은 RTT 환경에서 증가시키면 처리량 향상 |
 | `QUICSYNC_LOG` | `warn` | 로그 레벨 (`trace`, `debug`, `info`, `warn`, `error`) |
 
 ```bash
+# QUIC 윈도우를 128MB로 설정 (RTT가 매우 높은 환경)
+quicsync --window 128 /src user@host:/dst
+
+# 또는 환경변수로 설정 (서버 측에도 적용됨)
+QUICSYNC_WINDOW=128 quicsync /src user@host:/dst
+
 # 버퍼 크기를 512MB로 설정
 QUICSYNC_BUFFER_SIZE=536870912 quicsync /src user@host:/dst
 

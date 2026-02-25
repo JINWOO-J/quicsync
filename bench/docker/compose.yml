@@ -6,6 +6,8 @@ services:
     container_name: qs-server
     hostname: qs-server
     command: /usr/sbin/sshd -D
+    cap_add:
+      - NET_ADMIN  # tc netem 정리용
     networks:
       bench:
         ipv4_address: 172.30.0.10

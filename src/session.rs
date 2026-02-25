@@ -67,6 +67,7 @@ impl Session {
             remote_addr,
             auth_token: handshake.auth_token.clone(),
             server_name: "localhost".to_string(),
+            window_bytes: args.quic_window,
         })
         .await
         .map_err(|e| SessionError::InitFailed(format!("QUIC: {e}")))?;
@@ -103,8 +104,8 @@ impl Session {
 
         // 6. Buffer relay 태스크 spawn
         let buffer = BufferLayer::from_env();
-        let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel(256);
-        let (rev_tx, rev_rx) = tokio::sync::mpsc::channel(256);
+        let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel(1024);
+        let (rev_tx, rev_rx) = tokio::sync::mpsc::channel(1024);
 
         // TCP_Proxy relay: rsync TCP ↔ 채널
         tokio::spawn(async move {

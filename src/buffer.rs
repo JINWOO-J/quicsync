@@ -164,7 +164,7 @@ impl BufferLayer {
         mut quic_rx: RecvStream,
         tcp_tx: mpsc::Sender<Bytes>,
     ) -> Result<(), BufferError> {
-        let mut buf = vec![0u8; 64 * 1024]; // 64KB 읽기 버퍼
+        let mut buf = vec![0u8; 256 * 1024]; // 256KB 읽기 버퍼
         let mut total_bytes = 0u64;
         let mut chunk_count = 0u64;
 

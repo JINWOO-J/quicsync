@@ -9,11 +9,15 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 
 use crate::error::QuicError;
 
+/// 기본 QUIC 윈도우 크기: 64MB
+const DEFAULT_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
+
 /// QUIC 클라이언트 설정
 pub struct QuicClientCfg {
     pub remote_addr: SocketAddr,
     pub auth_token: String,
     pub server_name: String,
+    pub window_bytes: u64,
 }
 
 /// QUIC 연결 래퍼
@@ -25,7 +29,7 @@ impl QuicTunnel {
     /// QUIC 연결 수립 (클라이언트 측)
     pub async fn connect(config: QuicClientCfg) -> Result<Self, QuicError> {
         let mut endpoint = build_client_endpoint()?;
-        endpoint.set_default_client_config(build_client_config()?);
+        endpoint.set_default_client_config(build_client_config(config.window_bytes)?);
 
         let connection = endpoint
             .connect(config.remote_addr, &config.server_name)
@@ -65,15 +69,35 @@ pub fn generate_self_signed_cert() -> Result<(CertificateDer<'static>, PrivateKe
     Ok((cert_der, key_der))
 }
 
-/// BBR 혼잡 제어가 적용된 TransportConfig 생성
-fn bbr_transport_config() -> Arc<quinn::TransportConfig> {
+/// BBR 혼잡 제어 + 높은 BDP 네트워크를 위한 TransportConfig 생성
+///
+/// quinn 기본 윈도우(receive ~1.5MB, stream ~1MB)는 높은 RTT에서 병목이 된다.
+/// BDP 예시: 1Gbps × 500ms RTT = 62.5MB → 기본 64MB.
+/// `window_bytes`로 환경에 맞게 조절할 수 있다.
+fn bbr_transport_config(window_bytes: u64) -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+
+    let window = quinn::VarInt::from_u32(window_bytes.min(u32::MAX as u64) as u32);
+    transport.receive_window(window);
+    transport.stream_receive_window(window);
+    transport.send_window(window_bytes);
+
     Arc::new(transport)
 }
 
+/// 환경변수 `QUICSYNC_WINDOW`에서 윈도우 크기(MB)를 읽는다.
+/// 미설정이면 기본 64MB를 반환한다.
+pub fn window_bytes_from_env() -> u64 {
+    std::env::var("QUICSYNC_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(DEFAULT_WINDOW_BYTES)
+}
+
 /// 클라이언트용 quinn ClientConfig 생성 (자체 서명 인증서 허용, BBR)
-fn build_client_config() -> Result<quinn::ClientConfig, QuicError> {
+fn build_client_config(window_bytes: u64) -> Result<quinn::ClientConfig, QuicError> {
     let rustls_config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
@@ -83,7 +107,7 @@ fn build_client_config() -> Result<quinn::ClientConfig, QuicError> {
         .map_err(|e| QuicError::TlsError(e.to_string()))?;
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
-    client_config.transport_config(bbr_transport_config());
+    client_config.transport_config(bbr_transport_config(window_bytes));
 
     Ok(client_config)
 }
@@ -98,12 +122,13 @@ pub fn build_client_endpoint() -> Result<quinn::Endpoint, QuicError> {
 pub fn build_server_endpoint(
     bind_addr: SocketAddr,
     tls_config: rustls::ServerConfig,
+    window_bytes: u64,
 ) -> Result<quinn::Endpoint, QuicError> {
     let quic_config = QuicServerConfig::try_from(tls_config)
         .map_err(|e| QuicError::TlsError(e.to_string()))?;
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
-    server_config.transport = bbr_transport_config();
+    server_config.transport = bbr_transport_config(window_bytes);
 
     quinn::Endpoint::server(server_config, bind_addr)
         .map_err(|e| QuicError::ConnectionFailed(e.to_string()))
@@ -168,7 +193,7 @@ mod tests {
 
     #[test]
     fn build_client_config_succeeds() {
-        build_client_config().expect("client config should build");
+        build_client_config(DEFAULT_WINDOW_BYTES).expect("client config should build");
     }
 
     #[tokio::test]
@@ -185,6 +210,6 @@ mod tests {
             .expect("server TLS config should build");
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        build_server_endpoint(addr, tls_config).expect("server endpoint should bind");
+        build_server_endpoint(addr, tls_config, DEFAULT_WINDOW_BYTES).expect("server endpoint should bind");
     }
 }

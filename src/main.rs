@@ -140,10 +140,11 @@ async fn run_connect(port: u16, raw_args: &[String]) -> ExitCode {
             if r.is_err() || rev_r.is_err() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
         }
         r = &mut rev => {
-            // stdin fd를 닫아 blocking read를 중단시킨다.
-            // SAFETY: fd 0을 닫는 것은 이 프로세스에서만 영향을 미친다.
-            unsafe { libc::close(0); }
-            if r.is_err() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+            // rev 완료 = 서버에서 모든 데이터 수신 완료.
+            // fwd의 tokio blocking stdin reader는 close(0)으로 깨어나지 않을 수 있다
+            // (Docker socketpair 등). 프로세스를 즉시 종료한다.
+            let code = if r.is_err() { 1 } else { 0 };
+            std::process::exit(code);
         }
     }
 }

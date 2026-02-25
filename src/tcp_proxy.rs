@@ -13,8 +13,8 @@ pub struct TcpProxy {
     port: u16,
 }
 
-/// TCP 읽기 버퍼 크기: 64KB
-const TCP_READ_BUF_SIZE: usize = 64 * 1024;
+/// TCP 읽기 버퍼 크기: 256KB
+const TCP_READ_BUF_SIZE: usize = 256 * 1024;
 
 impl TcpProxy {
     /// 127.0.0.1:0에 바인딩하여 OS가 임시 포트를 할당하도록 한다.
