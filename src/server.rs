@@ -147,34 +147,46 @@ impl RemoteServer {
             .ok_or_else(|| ServerError::RsyncSpawnFailed("failed to capture stdout".into()))?;
 
         // 6. 양방향 중계: QUIC recv → rsync stdin, rsync stdout → QUIC send
-        let quic_to_rsync = async {
-            tokio::io::copy(&mut reader, &mut child_stdin).await?;
-            child_stdin.shutdown().await?;
-            Ok::<_, std::io::Error>(())
-        };
+        //
+        // tokio::join! 대신 rsync 프로세스 종료를 기준으로 정리한다.
+        //
+        // join!을 사용하면 데드락이 발생할 수 있다:
+        //   서버: quic_to_rsync가 QUIC recv EOF 대기 → 클라이언트 send finish 필요
+        //   클라이언트: --connect rev 완료 대기 → 서버 send finish 필요 → join! 완료 필요
+        //
+        // rsync 프로세스가 종료되면 양방향 모두 정리해야 한다.
+        let quic_to_rsync = tokio::spawn(async move {
+            let r = tokio::io::copy(&mut reader, &mut child_stdin).await;
+            let _ = child_stdin.shutdown().await;
+            r
+        });
 
         let mut stdout_reader = tokio::io::BufReader::new(child_stdout);
-        let rsync_to_quic = async {
-            tokio::io::copy(&mut stdout_reader, &mut send_stream).await?;
-            send_stream.finish().map_err(|e| std::io::Error::other(e))?;
-            Ok::<_, std::io::Error>(())
-        };
+        let rsync_to_quic = tokio::spawn(async move {
+            let r = tokio::io::copy(&mut stdout_reader, &mut send_stream).await;
+            if r.is_ok() {
+                let _ = send_stream.finish();
+            }
+            r
+        });
 
-        // 양방향 동시 실행 — 양쪽 모두 완료될 때까지 대기
-        // rsync 프로토콜은 양방향 비대칭이므로 한쪽이 먼저 끝나도 다른 쪽은 계속 진행해야 한다.
-        let (r1, r2) = tokio::join!(quic_to_rsync, rsync_to_quic);
-        if let Err(e) = r1 {
-            eprintln!("[quicsync-server] quic→rsync relay error: {e}");
-        }
-        if let Err(e) = r2 {
-            eprintln!("[quicsync-server] rsync→quic relay error: {e}");
-        }
-
-        // 7. rsync 종료 대기 및 종료 코드 반환
+        // 7. rsync 종료 대기 — relay 태스크와 동시에 실행
         let status = child
             .wait()
             .await
             .map_err(|e| ServerError::RelayError(format!("wait: {e}")))?;
+
+        // rsync가 종료되면 stdout은 EOF가 되므로 rsync_to_quic는 곧 완료된다.
+        // quic_to_rsync는 클라이언트가 finish()를 보내지 않으면 영원히 대기할 수 있으므로
+        // 타임아웃으로 정리한다.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rsync_to_quic,
+        ).await;
+
+        // quic_to_rsync는 rsync stdin이 닫혔으므로 copy가 에러/EOF로 끝나거나,
+        // 아직 QUIC 데이터를 기다리고 있을 수 있다. abort로 정리.
+        quic_to_rsync.abort();
 
         // 클라이언트가 모든 데이터를 수신한 후 연결을 닫을 때까지 대기.
         // send_stream.finish() 직후 endpoint.close()를 호출하면
