@@ -156,30 +156,40 @@ pub enum SessionError {
     ComponentError(String),
 }
 
-/// Blake3 무결성 검증 오류
+/// AuthToken 파싱 오류
+#[derive(Debug, Error)]
+pub enum TokenError {
+    #[error("invalid hex string: {0}")]
+    InvalidHex(String),
+
+    #[error("invalid token length: expected 32 bytes, got {0}")]
+    InvalidLength(usize),
+}
+
+/// Blake3 무결성 검사 오류
 #[derive(Debug, Error)]
 pub enum IntegrityError {
-    #[error("hash mismatch")]
-    HashMismatch,
+    #[error("hash mismatch: expected {expected}, actual {actual}")]
+    HashMismatch { expected: String, actual: String },
 
-    #[error("frame too short: expected at least 32 bytes, got {0}")]
+    #[error("frame too short: {0} bytes")]
     FrameTooShort(usize),
 }
 
-/// 인증서 지문 검증 오류
+/// 인증서 지문 오류
 #[derive(Debug, Error)]
 pub enum FingerprintError {
     #[error("invalid hex string: {0}")]
     InvalidHex(String),
 
-    #[error("invalid fingerprint length: expected 32 bytes, got {0}")]
+    #[error("invalid fingerprint length: {0} bytes")]
     InvalidLength(usize),
 
-    #[error("fingerprint mismatch")]
-    Mismatch,
+    #[error("fingerprint mismatch: expected {expected}, actual {actual}")]
+    Mismatch { expected: String, actual: String },
 }
 
-/// 통계 보고 오류
+/// 통계 리포트 오류
 #[derive(Debug, Error)]
 pub enum StatsError {
     #[error("serialization failed: {0}")]
@@ -189,34 +199,24 @@ pub enum StatsError {
     DeserializationFailed(String),
 }
 
-/// 텔레메트리 오류
+/// OpenTelemetry 오류
 #[derive(Debug, Error)]
 pub enum TelemetryError {
-    #[error("telemetry init failed: {0}")]
+    #[error("init failed: {0}")]
     InitFailed(String),
 
-    #[error("telemetry export failed: {0}")]
+    #[error("export failed: {0}")]
     ExportFailed(String),
 }
 
 /// 멀티스트림 오류
 #[derive(Debug, Error)]
 pub enum MultiStreamError {
-    #[error("stream failed: {0}")]
-    StreamFailed(String),
+    #[error("stream {stream_id} failed: {error}")]
+    StreamFailed { stream_id: usize, error: String },
 
     #[error("invalid stream count: {0}")]
-    InvalidStreamCount(String),
-}
-
-/// AuthToken 파싱 오류
-#[derive(Debug, Error)]
-pub enum TokenError {
-    #[error("invalid hex string: {0}")]
-    InvalidHex(String),
-
-    #[error("invalid token length: expected 32 bytes, got {0}")]
-    InvalidLength(usize),
+    InvalidStreamCount(u8),
 }
 
 /// Ring_Buffer가 가득 찼을 때 반환하는 오류

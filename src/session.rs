@@ -8,13 +8,14 @@ use tokio::sync::watch;
 use crate::buffer::BufferLayer;
 use crate::error::SessionError;
 use crate::metrics::TransferMetrics;
+use crate::multi_stream::MultiStreamManager;
 use crate::progress::ProgressUI;
-use crate::quic::{fingerprint_from_hex, QuicClientCfg, QuicTunnel};
+use crate::quic::{QuicClientCfg, QuicTunnel, fingerprint_from_hex};
 use crate::rsync::RsyncChild;
 use crate::ssh::launch_remote_server;
 use crate::stats::StatsReporter;
 use crate::tcp_proxy::TcpProxy;
-use crate::types::CliArgs;
+use crate::types::{CliArgs, MultiStreamReport, StatsFormat};
 
 /// 세션: SSH → QUIC → TCP_Proxy → rsync 전체 파이프라인을 관리한다.
 pub struct Session {
@@ -23,8 +24,12 @@ pub struct Session {
     rsync: RsyncChild,
     started_at: std::time::Instant,
     metrics: Arc<TransferMetrics>,
-    show_stats: bool,
-    stats_format: crate::types::StatsFormat,
+    streams: u8,
+    stats: bool,
+    stats_format: StatsFormat,
+    no_integrity: bool,
+    #[cfg(feature = "otel")]
+    telemetry: Option<crate::telemetry::TelemetryExporter>,
 }
 
 impl Session {
@@ -39,8 +44,29 @@ impl Session {
     pub async fn start(args: CliArgs) -> Result<Self, SessionError> {
         let started_at = std::time::Instant::now();
         let metrics = Arc::new(TransferMetrics::new());
-        let show_stats = args.stats;
-        let stats_format = args.stats_format;
+
+        // OpenTelemetry 초기화 (otel feature + endpoint 지정 시)
+        #[cfg(feature = "otel")]
+        let telemetry = if let Some(ref endpoint) = args.otel_endpoint {
+            match crate::telemetry::TelemetryExporter::init(endpoint) {
+                Ok(exporter) => {
+                    tracing::info!("OpenTelemetry initialized: {}", endpoint);
+                    Some(exporter)
+                }
+                Err(e) => {
+                    tracing::warn!("OpenTelemetry init failed (continuing without): {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        #[cfg(feature = "otel")]
+        let _session_span_guard = telemetry.as_ref().map(|t| {
+            let span = t.start_session_span(&args);
+            span
+        });
 
         let remote_display = match &args.remote.user {
             Some(u) => format!("{}@{}:{}", u, args.remote.host, args.remote.path),
@@ -72,15 +98,15 @@ impl Session {
             .next()
             .ok_or_else(|| SessionError::InitFailed(format!("no address found for {host_port}")))?;
 
-        // 핸드셰이크에서 수신한 지문을 바이트로 변환
+        // 2. QUIC 터널 수립 (핸드셰이크에 지문이 있으면 핀닝 검증 적용)
+        tracing::info!("connecting QUIC tunnel to {}...", remote_addr);
         let fingerprint = match &handshake.fingerprint {
-            Some(hex) => Some(fingerprint_from_hex(hex)
-                .map_err(|e| SessionError::InitFailed(format!("fingerprint: {e}")))?),
+            Some(fp_hex) => Some(
+                fingerprint_from_hex(fp_hex)
+                    .map_err(|e| SessionError::InitFailed(format!("fingerprint: {e}")))?
+            ),
             None => None,
         };
-
-        // 2. QUIC 터널 수립
-        tracing::info!("connecting QUIC tunnel to {}...", remote_addr);
         let tunnel = QuicTunnel::connect(QuicClientCfg {
             remote_addr,
             auth_token: handshake.auth_token.clone(),
@@ -98,6 +124,7 @@ impl Session {
             .map_err(|e| SessionError::InitFailed(format!("QUIC stream: {e}")))?;
 
         // 인증 토큰을 첫 번째 메시지로 전송
+        // rsync 서버 인수는 --connect 모드가 rsh 호출에서 추출하여 TCP 프록시를 통해 전송한다.
         send_stream
             .write_all(format!("{}\n", handshake.auth_token).as_bytes())
             .await
@@ -120,16 +147,7 @@ impl Session {
         )
         .map_err(|e| SessionError::InitFailed(format!("rsync: {e}")))?;
 
-        // 6. Progress UI spawn (show_progress이면)
-        if args.show_progress {
-            let progress = ProgressUI {
-                metrics: metrics.clone(),
-                enabled: true,
-            };
-            tokio::spawn(async move { progress.run().await });
-        }
-
-        // 7. Buffer relay 태스크 spawn
+        // 6. Buffer relay 태스크 spawn
         let buffer = BufferLayer::from_env();
         let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel(1024);
         let (rev_tx, rev_rx) = tokio::sync::mpsc::channel(1024);
@@ -141,24 +159,35 @@ impl Session {
             }
         });
 
-        // Buffer forward relay: 채널 → QUIC SendStream (메트릭 연동)
-        let fwd_metrics = Some(metrics.clone());
+        // Buffer forward relay: 채널 → QUIC SendStream
         tokio::spawn(async move {
-            if let Err(e) = buffer.relay_forward(fwd_rx, send_stream, fwd_metrics).await {
+            if let Err(e) = buffer.relay_forward(fwd_rx, send_stream).await {
                 tracing::error!("forward relay error: {e}");
             }
         });
 
-        // Buffer reverse relay: QUIC RecvStream → 채널 (메트릭 연동)
+        // Buffer reverse relay: QUIC RecvStream → 채널
         let reverse_buffer = BufferLayer::from_env();
-        let rev_metrics = Some(metrics.clone());
         tokio::spawn(async move {
-            if let Err(e) = reverse_buffer.relay_reverse(recv_stream, rev_tx, rev_metrics).await {
+            if let Err(e) = reverse_buffer.relay_reverse(recv_stream, rev_tx).await {
                 tracing::error!("reverse relay error: {e}");
             }
         });
 
-        tracing::info!("session started, waiting for rsync to complete...");
+        // TODO: integrate encode_chunk/decode_chunk into relay when no_integrity is false
+
+        // Progress UI 스폰 (show_progress가 true일 때)
+        if args.show_progress {
+            let progress = ProgressUI::new(metrics.clone(), true);
+            tokio::spawn(async move { progress.run().await });
+        }
+
+        let streams = args.streams;
+        let stats = args.stats;
+        let stats_format = args.stats_format;
+        let no_integrity = args.no_integrity;
+
+        tracing::info!("session started (streams={streams}), waiting for rsync to complete...");
 
         Ok(Self {
             ssh_process,
@@ -166,8 +195,12 @@ impl Session {
             rsync,
             started_at,
             metrics,
-            show_stats,
+            streams,
+            stats,
             stats_format,
+            no_integrity,
+            #[cfg(feature = "otel")]
+            telemetry,
         })
     }
 
@@ -180,7 +213,9 @@ impl Session {
 
         let Session {
             mut ssh_process, tunnel, rsync, started_at,
-            metrics, show_stats, stats_format,
+            metrics, streams, stats, stats_format, no_integrity: _,
+            #[cfg(feature = "otel")]
+            telemetry,
         } = self;
 
         tokio::select! {
@@ -202,10 +237,29 @@ impl Session {
                 shutdown(tunnel, &mut ssh_process).await;
                 let elapsed = started_at.elapsed();
 
-                // 통계 보고
-                if show_stats {
-                    let reporter = StatsReporter { format: stats_format };
+                // Stats 리포트 출력 (--stats 플래그 활성 시)
+                if stats {
+                    let reporter = StatsReporter::new(stats_format);
                     reporter.report(&metrics.snapshot());
+                }
+
+                // 멀티스트림 병렬 전송 경로 (향후 파일 목록 기반 병렬 전송 시 활성화)
+                // 현재 rsync는 단일 TCP 프록시 스트림으로 동작한다.
+                // 디렉토리 전송 시 파일 목록을 확보하면 아래 경로로 병렬 전송:
+                //
+                //   if streams > 1 && has_file_list {
+                //       let manager = MultiStreamManager::new(
+                //           tunnel.connection().clone(), streams, metrics.clone(),
+                //       );
+                //       let report = manager.transfer_files(file_list).await;
+                //       log_multi_stream_report(&report);
+                //   }
+                let _ = streams; // used when multi-stream transfer is activated
+
+                // OpenTelemetry 종료
+                #[cfg(feature = "otel")]
+                if let Some(telem) = telemetry {
+                    telem.shutdown();
                 }
 
                 if code == 0 {
@@ -218,6 +272,12 @@ impl Session {
             _ = signal_rx.changed() => {
                 tracing::warn!("signal received, aborting session...");
                 abort(tunnel, &mut ssh_process).await;
+
+                #[cfg(feature = "otel")]
+                if let Some(telem) = telemetry {
+                    telem.shutdown();
+                }
+
                 Ok(130) // SIGINT → 128+2=130
             }
         }
@@ -248,6 +308,21 @@ async fn abort(tunnel: QuicTunnel, ssh_process: &mut tokio::process::Child) {
 
     tracing::info!("session abort complete");
 }
+/// 멀티스트림 전송 결과를 stderr에 출력한다.
+fn log_multi_stream_report(report: &MultiStreamReport) {
+    eprintln!(
+        "quicsync: multi-stream transfer: {} succeeded, {} failed ({} total)",
+        report.total_success,
+        report.total_failed,
+        report.results.len(),
+    );
+    for r in &report.results {
+        if let Some(ref err) = r.error {
+            eprintln!("  stream {}: FAILED - {}", r.stream_id, err);
+        }
+    }
+}
+
 /// SIGINT/SIGTERM 시그널 핸들러를 등록한다.
 /// 시그널 수신 시 watch 채널을 통해 true를 전파한다.
 pub fn install_signal_handlers() -> Result<watch::Receiver<bool>, SessionError> {
