@@ -1,0 +1,37 @@
+services:
+  server:
+    build:
+      context: ../..
+      dockerfile: bench/docker/Dockerfile
+    container_name: qs-server
+    hostname: qs-server
+    command: /usr/sbin/sshd -D
+    networks:
+      bench:
+        ipv4_address: 172.30.0.10
+    tmpfs:
+      - /app/upload-test:size=2G
+
+  client:
+    build:
+      context: ../..
+      dockerfile: bench/docker/Dockerfile
+    container_name: qs-client
+    hostname: qs-client
+    cap_add:
+      - NET_ADMIN  # tc netem
+    command: sleep infinity
+    depends_on:
+      - server
+    networks:
+      bench:
+        ipv4_address: 172.30.0.20
+    tmpfs:
+      - /tmp/bench:size=2G
+
+networks:
+  bench:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

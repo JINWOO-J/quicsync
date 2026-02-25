@@ -1,3 +1,4 @@
 /target
 /dist
 bench/results.csv
+bench/latency_sweep.csv
