@@ -6,7 +6,7 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    openssh-server openssh-client rsync iproute2 iputils-ping \
+    openssh-server openssh-client rsync iproute2 iputils-ping bc \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd /root/.ssh /app/upload-test
 
