@@ -1,4 +1,4 @@
-.PHONY: build release test check clean install release-all dist bump
+.PHONY: build release test check clean install release-all dist dist-bump bump
 
 UNAME_S := $(shell uname -s)
 
@@ -96,7 +96,7 @@ bump:
 	echo "$$CURRENT → $$NEW"
 
 # 빌드 결과를 dist/에 모아서 배포용으로 정리
-dist: bump release-all
+dist: release-all
 	mkdir -p $(DIST_DIR)
 	@cp -f target/release/quicsync $(DIST_DIR)/quicsync-$(UNAME_S)-native 2>/dev/null || true
 	@for target in aarch64-apple-darwin x86_64-apple-darwin $(LINUX_TARGETS); do \
@@ -129,6 +129,8 @@ dist: bump release-all
 	fi
 	@echo "Artifacts in $(DIST_DIR)/:"
 	@ls -lh $(DIST_DIR)/
+
+dist-bump: bump dist
 
 deploy: dist
 	scp -p target/x86_64-unknown-linux-gnu/release/quicsync $(SERVER_USER)@$(DEPLOY_SERVER):/usr/local/bin/

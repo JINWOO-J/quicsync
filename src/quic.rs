@@ -103,6 +103,7 @@ pub fn window_bytes_from_env() -> u64 {
 }
 
 /// 클라이언트용 quinn ClientConfig 생성 (자체 서명 인증서 허용, BBR)
+#[cfg(test)]
 fn build_client_config(window_bytes: u64) -> Result<quinn::ClientConfig, QuicError> {
     let rustls_config = rustls::ClientConfig::builder()
         .dangerous()

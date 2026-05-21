@@ -8,7 +8,6 @@ use tokio::sync::watch;
 use crate::buffer::BufferLayer;
 use crate::error::{SessionError, SshError};
 use crate::metrics::TransferMetrics;
-use crate::multi_stream::MultiStreamManager;
 use crate::progress::ProgressUI;
 use crate::quic::{QuicClientCfg, QuicTunnel, fingerprint_from_hex};
 use crate::remote_install::RemoteInstaller;
@@ -16,7 +15,7 @@ use crate::rsync::RsyncChild;
 use crate::ssh::launch_remote_server;
 use crate::stats::StatsReporter;
 use crate::tcp_proxy::TcpProxy;
-use crate::types::{CliArgs, MultiStreamReport, StatsFormat};
+use crate::types::{CliArgs, StatsFormat};
 
 /// 세션: SSH → QUIC → TCP_Proxy → rsync 전체 파이프라인을 관리한다.
 pub struct Session {
@@ -28,7 +27,6 @@ pub struct Session {
     streams: u8,
     stats: bool,
     stats_format: StatsFormat,
-    no_integrity: bool,
     #[cfg(feature = "otel")]
     telemetry: Option<crate::telemetry::TelemetryExporter>,
 }
@@ -204,7 +202,7 @@ impl Session {
         let streams = args.streams;
         let stats = args.stats;
         let stats_format = args.stats_format;
-        let no_integrity = args.no_integrity;
+        let _no_integrity = args.no_integrity;
 
         tracing::info!("session started (streams={streams}), waiting for rsync to complete...");
 
@@ -217,7 +215,6 @@ impl Session {
             streams,
             stats,
             stats_format,
-            no_integrity,
             #[cfg(feature = "otel")]
             telemetry,
         })
@@ -239,7 +236,6 @@ impl Session {
             streams,
             stats,
             stats_format,
-            no_integrity: _,
             #[cfg(feature = "otel")]
             telemetry,
         } = self;
@@ -333,20 +329,6 @@ async fn abort(tunnel: QuicTunnel, ssh_process: &mut tokio::process::Child) {
     let _ = ssh_process.kill().await;
 
     tracing::info!("session abort complete");
-}
-/// 멀티스트림 전송 결과를 stderr에 출력한다.
-fn log_multi_stream_report(report: &MultiStreamReport) {
-    eprintln!(
-        "quicsync: multi-stream transfer: {} succeeded, {} failed ({} total)",
-        report.total_success,
-        report.total_failed,
-        report.results.len(),
-    );
-    for r in &report.results {
-        if let Some(ref err) = r.error {
-            eprintln!("  stream {}: FAILED - {}", r.stream_id, err);
-        }
-    }
 }
 
 /// SIGINT/SIGTERM 시그널 핸들러를 등록한다.
