@@ -10,7 +10,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::error::ServerError;
-use crate::quic::{build_server_endpoint, generate_self_signed_cert, sha256_fingerprint, fingerprint_to_hex};
+use crate::quic::{
+    build_server_endpoint, fingerprint_to_hex, generate_self_signed_cert, sha256_fingerprint,
+};
 use crate::types::AuthToken;
 
 /// 원격 서버: QUIC 리스닝 → 토큰 검증 → rsync 중계
@@ -36,8 +38,9 @@ impl RemoteServer {
             .map_err(|e| ServerError::StartFailed(format!("TLS config: {e}")))?;
 
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let endpoint = build_server_endpoint(bind_addr, tls_config, crate::quic::window_bytes_from_env())
-            .map_err(|e| ServerError::StartFailed(format!("endpoint: {e}")))?;
+        let endpoint =
+            build_server_endpoint(bind_addr, tls_config, crate::quic::window_bytes_from_env())
+                .map_err(|e| ServerError::StartFailed(format!("endpoint: {e}")))?;
 
         let port = endpoint
             .local_addr()
@@ -136,7 +139,8 @@ impl RemoteServer {
             .await
             .map_err(|e| ServerError::RelayError(format!("read args: {e}")))?;
 
-        let rsync_args: Vec<&str> = args_line.trim().split_whitespace().collect();
+        let rsync_args: Vec<String> = serde_json::from_str(args_line.trim())
+            .map_err(|e| ServerError::RelayError(format!("parse rsync args: {e}")))?;
 
         // 5. rsync 서버 프로세스 spawn (stdin/stdout 파이프)
         let mut child = Command::new("rsync")

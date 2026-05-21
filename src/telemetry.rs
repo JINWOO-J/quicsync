@@ -12,8 +12,8 @@ impl TelemetryExporter {
     pub fn init(endpoint: &str) -> Result<Self, TelemetryError> {
         #[cfg(feature = "otel")]
         {
-            use opentelemetry_sdk::trace::TracerProvider;
             use opentelemetry_otlp::WithExportConfig;
+            use opentelemetry_sdk::trace::TracerProvider;
 
             let exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_tonic()

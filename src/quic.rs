@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{SendStream, RecvStream};
+use quinn::{RecvStream, SendStream};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 
 use crate::error::{FingerprintError, QuicError};
@@ -30,7 +30,10 @@ impl QuicTunnel {
     /// QUIC 연결 수립 (클라이언트 측)
     pub async fn connect(config: QuicClientCfg) -> Result<Self, QuicError> {
         let mut endpoint = build_client_endpoint()?;
-        endpoint.set_default_client_config(build_client_config(config.window_bytes, config.fingerprint)?);
+        endpoint.set_default_client_config(build_client_config(
+            config.window_bytes,
+            config.fingerprint,
+        )?);
 
         let connection = endpoint
             .connect(config.remote_addr, &config.server_name)
@@ -59,7 +62,8 @@ impl QuicTunnel {
 // --- Endpoint 구성 ---
 
 /// 자체 서명 인증서 생성 (일회성 세션용)
-pub fn generate_self_signed_cert() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), QuicError> {
+pub fn generate_self_signed_cert()
+-> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), QuicError> {
     let rcgen::CertifiedKey { cert, key_pair } =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
             .map_err(|e| QuicError::TlsError(e.to_string()))?;
@@ -158,8 +162,8 @@ pub fn build_server_endpoint(
     tls_config: rustls::ServerConfig,
     window_bytes: u64,
 ) -> Result<quinn::Endpoint, QuicError> {
-    let quic_config = QuicServerConfig::try_from(tls_config)
-        .map_err(|e| QuicError::TlsError(e.to_string()))?;
+    let quic_config =
+        QuicServerConfig::try_from(tls_config).map_err(|e| QuicError::TlsError(e.to_string()))?;
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
     server_config.transport = bbr_transport_config(window_bytes);
@@ -332,7 +336,8 @@ mod tests {
     #[test]
     fn build_client_config_with_fingerprint() {
         let fp = [0xABu8; 32];
-        build_client_config(DEFAULT_WINDOW_BYTES, Some(fp)).expect("client config with fp should build");
+        build_client_config(DEFAULT_WINDOW_BYTES, Some(fp))
+            .expect("client config with fp should build");
     }
 
     #[tokio::test]
@@ -349,7 +354,8 @@ mod tests {
             .expect("server TLS config should build");
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        build_server_endpoint(addr, tls_config, DEFAULT_WINDOW_BYTES).expect("server endpoint should bind");
+        build_server_endpoint(addr, tls_config, DEFAULT_WINDOW_BYTES)
+            .expect("server endpoint should bind");
     }
 
     // --- fingerprint 테스트 ---

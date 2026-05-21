@@ -111,9 +111,24 @@ mod tests {
     #[test]
     fn multi_stream_report_mixed_results() {
         let results = vec![
-            StreamResult { stream_id: 0, success: true, bytes_transferred: 100, error: None },
-            StreamResult { stream_id: 1, success: false, bytes_transferred: 0, error: Some("timeout".into()) },
-            StreamResult { stream_id: 2, success: true, bytes_transferred: 200, error: None },
+            StreamResult {
+                stream_id: 0,
+                success: true,
+                bytes_transferred: 100,
+                error: None,
+            },
+            StreamResult {
+                stream_id: 1,
+                success: false,
+                bytes_transferred: 0,
+                error: Some("timeout".into()),
+            },
+            StreamResult {
+                stream_id: 2,
+                success: true,
+                bytes_transferred: 200,
+                error: None,
+            },
         ];
         let report = MultiStreamReport::from_results(results);
         assert_eq!(report.total_success, 2);
@@ -140,9 +155,18 @@ mod tests {
         let metrics = Arc::new(TransferMetrics::new());
         let mgr = MultiStreamManager::new(4, metrics.clone()).unwrap();
         let files = vec![
-            FileEntry { path: "a.txt".into(), size: 100 },
-            FileEntry { path: "b.txt".into(), size: 200 },
-            FileEntry { path: "c.txt".into(), size: 300 },
+            FileEntry {
+                path: "a.txt".into(),
+                size: 100,
+            },
+            FileEntry {
+                path: "b.txt".into(),
+                size: 200,
+            },
+            FileEntry {
+                path: "c.txt".into(),
+                size: 300,
+            },
         ];
         let report = mgr.transfer_files(&files).await;
         assert_eq!(report.total_success, 3);

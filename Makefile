@@ -98,6 +98,28 @@ dist: bump release-all
 			echo "Copied quicsync-$$target"; \
 		fi; \
 	done
+	@rm -f $(DIST_DIR)/quicsync_*.tar.gz $(DIST_DIR)/checksums.txt
+	@package() { \
+		src="$$1"; asset="$$2"; \
+		if [ -f "$$src" ]; then \
+			tmp=$$(mktemp -d); \
+			cp "$$src" "$$tmp/quicsync"; \
+			tar -C "$$tmp" -czf "$(DIST_DIR)/$$asset" quicsync; \
+			rm -rf "$$tmp"; \
+			echo "Packaged $$asset"; \
+		fi; \
+	}; \
+	package target/x86_64-unknown-linux-gnu/release/quicsync quicsync_linux_x86_64.tar.gz; \
+	package target/aarch64-unknown-linux-gnu/release/quicsync quicsync_linux_aarch64.tar.gz; \
+	package target/x86_64-apple-darwin/release/quicsync quicsync_macos_x86_64.tar.gz; \
+	if [ "$(UNAME_S)" = "Darwin" ]; then \
+		arch=$$(uname -m); \
+		package target/release/quicsync quicsync_macos_$$arch.tar.gz; \
+	fi
+	@if ls $(DIST_DIR)/quicsync_*.tar.gz >/dev/null 2>&1; then \
+		(cd $(DIST_DIR) && shasum -a 256 quicsync_*.tar.gz > checksums.txt); \
+		echo "Wrote $(DIST_DIR)/checksums.txt"; \
+	fi
 	@echo "Artifacts in $(DIST_DIR)/:"
 	@ls -lh $(DIST_DIR)/
 

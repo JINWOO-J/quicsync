@@ -65,13 +65,19 @@ pub enum CliError {
 /// SSH 관련 오류
 #[derive(Debug, Error)]
 pub enum SshError {
-    #[error("SSH connection failed: {0}")]
+    #[error(
+        "SSH connection failed: {0}. Check the remote host, username, SSH config, and network reachability."
+    )]
     ConnectionFailed(String),
 
-    #[error("binary not found on remote: {0}")]
+    #[error(
+        "quicsync binary not found on remote: {0}. Install quicsync on the remote host or add it to PATH."
+    )]
     BinaryNotFound(String),
 
-    #[error("handshake timed out")]
+    #[error(
+        "remote server handshake timed out. Check SSH connectivity and whether 'quicsync --server' can start on the remote host."
+    )]
     HandshakeTimeout,
 
     #[error("handshake parse failed: {0}")]
@@ -101,7 +107,9 @@ pub enum BufferError {
 /// QUIC 터널 오류
 #[derive(Debug, Error)]
 pub enum QuicError {
-    #[error("QUIC connection failed: {0}")]
+    #[error(
+        "QUIC connection failed: {0}. Check that UDP is allowed between hosts, or retry with --fallback=rsync."
+    )]
     ConnectionFailed(String),
 
     #[error("QUIC stream error: {0}")]

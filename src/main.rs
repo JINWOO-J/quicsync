@@ -1,8 +1,13 @@
 use std::process::ExitCode;
 
 use quicsync::cli::parse_args;
+use quicsync::doctor::{Doctor, parse_doctor_args};
+use quicsync::remote_install::{RemoteInstaller, parse_install_remote_args};
+use quicsync::rsync::RsyncChild;
 use quicsync::server::RemoteServer;
 use quicsync::session::Session;
+use quicsync::types::FallbackMode;
+use quicsync::update::{Updater, parse_update_args};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -23,12 +28,89 @@ async fn main() -> ExitCode {
         return run_server().await;
     }
 
+    if raw_args.get(1).is_some_and(|a| a == "doctor") {
+        init_tracing(0);
+        return run_doctor(&raw_args).await;
+    }
+
+    if raw_args.get(1).is_some_and(|a| a == "install-remote") {
+        init_tracing(0);
+        return run_install_remote(&raw_args).await;
+    }
+
+    if raw_args.get(1).is_some_and(|a| a == "update") {
+        init_tracing(0);
+        return run_update(&raw_args).await;
+    }
+
     let verbosity = count_verbose_flags(&raw_args);
     init_tracing(verbosity);
 
     tracing::debug!("quicsync v{}", env!("CARGO_PKG_VERSION"));
 
     run_client(&raw_args).await
+}
+
+async fn run_doctor(raw_args: &[String]) -> ExitCode {
+    let args = match parse_doctor_args(raw_args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("quicsync doctor: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let json = args.json;
+    let report = Doctor::new(args).run().await;
+    if json {
+        report.print_json();
+    } else {
+        report.print();
+    }
+    if report.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+async fn run_install_remote(raw_args: &[String]) -> ExitCode {
+    let args = match parse_install_remote_args(raw_args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("quicsync install-remote: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match RemoteInstaller::install_current(&args.remote, &args.install_dir).await {
+        Ok(version) => {
+            eprintln!("quicsync install-remote: installed {version}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("quicsync install-remote: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_update(raw_args: &[String]) -> ExitCode {
+    let args = match parse_update_args(raw_args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("quicsync update: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match Updater::run(args).await {
+        Ok(code) => exit_code(code),
+        Err(e) => {
+            eprintln!("quicsync update: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// -v 플래그 개수를 센다. `-v`, `-vv`, `-vvv` 및 개별 `-v -v -v` 모두 지원.
@@ -61,6 +143,13 @@ async fn run_connect(port: u16, raw_args: &[String]) -> ExitCode {
     use tokio::net::TcpStream;
 
     let rsync_server_args = extract_rsync_server_args(raw_args);
+    let args_frame = match serde_json::to_string(&rsync_server_args) {
+        Ok(frame) => frame,
+        Err(e) => {
+            eprintln!("quicsync --connect: failed to encode rsync args: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let stream = match TcpStream::connect(("127.0.0.1", port)).await {
         Ok(s) => s,
@@ -83,8 +172,9 @@ async fn run_connect(port: u16, raw_args: &[String]) -> ExitCode {
     // TCP 연결은 --connect 프로세스 종료 시에만 닫힌다.
     let (mut tcp_read, mut tcp_write) = tokio::io::split(stream);
 
-    // rsync 서버 인수를 TCP 프록시를 통해 원격 서버로 전송
-    let args_line = format!("{rsync_server_args}\n");
+    // rsync 서버 인수를 TCP 프록시를 통해 원격 서버로 전송.
+    // JSON array framing을 사용해 공백/quote가 포함된 경로와 옵션을 보존한다.
+    let args_line = format!("{args_frame}\n");
     if let Err(e) = tcp_write.write_all(args_line.as_bytes()).await {
         eprintln!("quicsync --connect: failed to send rsync args: {e}");
         return ExitCode::FAILURE;
@@ -109,9 +199,7 @@ async fn run_connect(port: u16, raw_args: &[String]) -> ExitCode {
             }
         }
     }
-    let fwd = tokio::spawn(async move {
-        tokio::io::copy(&mut stdin, &mut tcp_write).await
-    });
+    let fwd = tokio::spawn(async move { tokio::io::copy(&mut stdin, &mut tcp_write).await });
 
     // tcp → stdout: 서버에서 오는 데이터를 rsync에 전달.
     let rev = async {
@@ -155,7 +243,7 @@ async fn run_connect(port: u16, raw_args: &[String]) -> ExitCode {
 ///   PROGRAM --connect PORT [-l user] host rsync --server [flags] . path
 ///
 /// "rsync" 인수를 찾아 그 이후의 모든 인수(`--server [flags] . path`)를 반환한다.
-fn extract_rsync_server_args(raw_args: &[String]) -> String {
+fn extract_rsync_server_args(raw_args: &[String]) -> Vec<String> {
     // --connect PORT 이후의 인수를 수집
     let mut iter = raw_args.iter().skip(1); // 프로그램 이름 건너뜀
     let mut after_connect = Vec::new();
@@ -170,9 +258,12 @@ fn extract_rsync_server_args(raw_args: &[String]) -> String {
 
     // "rsync" 인수를 찾아 그 다음부터의 모든 인수를 반환
     if let Some(pos) = after_connect.iter().position(|&a| a == "rsync") {
-        after_connect[pos + 1..].join(" ")
+        after_connect[pos + 1..]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
     } else {
-        String::new()
+        Vec::new()
     }
 }
 
@@ -193,9 +284,7 @@ fn init_tracing(verbosity: usize) {
         EnvFilter::new(level)
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 /// --server 모드: 원격 호스트에서 SSH를 통해 실행된다.
@@ -225,11 +314,20 @@ async fn run_client(raw_args: &[String]) -> ExitCode {
         }
     };
 
+    let fallback = args.fallback;
+    let fallback_args = args.clone();
+
     let session = match Session::start(args).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("quicsync: {e}");
-            return ExitCode::FAILURE;
+            if fallback == FallbackMode::Rsync {
+                eprintln!("quicsync: {e}");
+                eprintln!("quicsync: falling back to rsync over SSH (--fallback=rsync)");
+                return run_rsync_fallback(fallback_args).await;
+            } else {
+                eprintln!("quicsync: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     };
 
@@ -237,6 +335,30 @@ async fn run_client(raw_args: &[String]) -> ExitCode {
         Ok(code) => exit_code(code),
         Err(e) => {
             eprintln!("quicsync: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_rsync_fallback(args: quicsync::types::CliArgs) -> ExitCode {
+    let rsync = match RsyncChild::spawn_direct(
+        &args.rsync_options,
+        &args.local_paths,
+        &args.remote,
+        args.direction,
+    ) {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("quicsync fallback: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match rsync.wait().await {
+        Ok(code) => exit_code(code),
+        Err(quicsync::error::RsyncError::ExitCode(code)) => exit_code(code),
+        Err(e) => {
+            eprintln!("quicsync fallback: {e}");
             ExitCode::FAILURE
         }
     }
@@ -263,12 +385,21 @@ mod tests {
     fn extract_rsync_server_args_typical_push() {
         // rsync이 push 시 rsh에 전달하는 전형적인 인수
         let args = s(&[
-            "quicsync", "--connect", "54220", "-l", "root", "jwserver68",
-            "rsync", "--server", "-vvve.LsfxCIvu", ".", "/app/upload-test",
+            "quicsync",
+            "--connect",
+            "54220",
+            "-l",
+            "root",
+            "jwserver68",
+            "rsync",
+            "--server",
+            "-vvve.LsfxCIvu",
+            ".",
+            "/app/upload-test",
         ]);
         assert_eq!(
             extract_rsync_server_args(&args),
-            "--server -vvve.LsfxCIvu . /app/upload-test"
+            vec!["--server", "-vvve.LsfxCIvu", ".", "/app/upload-test"]
         );
     }
 
@@ -276,12 +407,19 @@ mod tests {
     fn extract_rsync_server_args_no_login_flag() {
         // user 없이 호출되는 경우 (-l 플래그 없음)
         let args = s(&[
-            "quicsync", "--connect", "12345", "myhost",
-            "rsync", "--server", "-e.LsfxC", ".", "/data",
+            "quicsync",
+            "--connect",
+            "12345",
+            "myhost",
+            "rsync",
+            "--server",
+            "-e.LsfxC",
+            ".",
+            "/data",
         ]);
         assert_eq!(
             extract_rsync_server_args(&args),
-            "--server -e.LsfxC . /data"
+            vec!["--server", "-e.LsfxC", ".", "/data"]
         );
     }
 
@@ -289,12 +427,28 @@ mod tests {
     fn extract_rsync_server_args_pull_with_sender() {
         // pull 시 rsync가 --sender 플래그를 추가
         let args = s(&[
-            "quicsync", "--connect", "8080", "-l", "user", "host",
-            "rsync", "--server", "--sender", "-vvve.LsfxCIvu", ".", "/remote/path",
+            "quicsync",
+            "--connect",
+            "8080",
+            "-l",
+            "user",
+            "host",
+            "rsync",
+            "--server",
+            "--sender",
+            "-vvve.LsfxCIvu",
+            ".",
+            "/remote/path",
         ]);
         assert_eq!(
             extract_rsync_server_args(&args),
-            "--server --sender -vvve.LsfxCIvu . /remote/path"
+            vec![
+                "--server",
+                "--sender",
+                "-vvve.LsfxCIvu",
+                ".",
+                "/remote/path"
+            ]
         );
     }
 
@@ -302,13 +456,32 @@ mod tests {
     fn extract_rsync_server_args_no_rsync_found() {
         // rsync 인수가 없는 비정상 케이스 → 빈 문자열 반환
         let args = s(&["quicsync", "--connect", "54220", "-l", "root", "host"]);
-        assert_eq!(extract_rsync_server_args(&args), "");
+        assert!(extract_rsync_server_args(&args).is_empty());
     }
 
     #[test]
     fn extract_rsync_server_args_no_connect_flag() {
         // --connect 없는 경우 → 빈 문자열 반환
         let args = s(&["quicsync", "rsync", "--server", ".", "/path"]);
-        assert_eq!(extract_rsync_server_args(&args), "");
+        assert!(extract_rsync_server_args(&args).is_empty());
+    }
+
+    #[test]
+    fn extract_rsync_server_args_preserves_spaces() {
+        let args = s(&[
+            "quicsync",
+            "--connect",
+            "54220",
+            "host",
+            "rsync",
+            "--server",
+            "-e.LsfxC",
+            ".",
+            "/remote/path with spaces",
+        ]);
+        assert_eq!(
+            extract_rsync_server_args(&args),
+            vec!["--server", "-e.LsfxC", ".", "/remote/path with spaces"]
+        );
     }
 }

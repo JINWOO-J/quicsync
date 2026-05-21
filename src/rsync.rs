@@ -73,6 +73,41 @@ pub fn build_rsync_args(
     args
 }
 
+/// fallback용 순정 rsync-over-SSH 인수를 구성한다.
+pub fn build_direct_rsync_args(
+    rsync_options: &[String],
+    local_paths: &[PathBuf],
+    remote: &RemoteSpec,
+    direction: TransferDirection,
+) -> Vec<String> {
+    let mut args = Vec::new();
+
+    let has_stats = rsync_options.iter().any(|opt| opt == "--stats");
+    if !has_stats {
+        args.push("--stats".to_string());
+    }
+
+    args.extend(rsync_options.iter().cloned());
+    let remote_spec = format_remote_spec(remote);
+
+    match direction {
+        TransferDirection::Push => {
+            for p in local_paths {
+                args.push(p.to_string_lossy().to_string());
+            }
+            args.push(remote_spec);
+        }
+        TransferDirection::Pull => {
+            args.push(remote_spec);
+            for p in local_paths {
+                args.push(p.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    args
+}
+
 impl RsyncChild {
     /// rsync 자식 프로세스를 실행한다.
     ///
@@ -87,6 +122,27 @@ impl RsyncChild {
     ) -> Result<Self, RsyncError> {
         let args = build_rsync_args(rsync_options, local_paths, remote, proxy_port, direction);
         tracing::debug!("rsync spawn: rsync {}", args.join(" "));
+
+        let process = Command::new("rsync")
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| RsyncError::SpawnFailed(e.to_string()))?;
+
+        Ok(Self { process })
+    }
+
+    /// 순정 rsync-over-SSH fallback 프로세스를 실행한다.
+    pub fn spawn_direct(
+        rsync_options: &[String],
+        local_paths: &[PathBuf],
+        remote: &RemoteSpec,
+        direction: TransferDirection,
+    ) -> Result<Self, RsyncError> {
+        let args = build_direct_rsync_args(rsync_options, local_paths, remote, direction);
+        tracing::debug!("rsync fallback spawn: rsync {}", args.join(" "));
 
         let process = Command::new("rsync")
             .args(&args)
@@ -143,8 +199,7 @@ mod tests {
 
     /// 영문 소문자+숫자로 구성된 비어있지 않은 문자열 생성기
     fn alphanumeric_str(min: usize, max: usize) -> impl Strategy<Value = String> {
-        prop::string::string_regex(&format!("[a-z0-9]{{{},{}}}", min, max))
-            .expect("valid regex")
+        prop::string::string_regex(&format!("[a-z0-9]{{{},{}}}", min, max)).expect("valid regex")
     }
 
     /// rsync 옵션 생성기: `-` 로 시작하는 문자열
@@ -306,6 +361,47 @@ mod tests {
     }
 
     #[test]
+    fn build_direct_args_push_has_no_rsh() {
+        let remote = RemoteSpec {
+            user: Some("deploy".into()),
+            host: "server".into(),
+            path: "/dst".into(),
+        };
+        let args = build_direct_rsync_args(
+            &["-a".into()],
+            &[PathBuf::from("/src")],
+            &remote,
+            TransferDirection::Push,
+        );
+
+        assert_eq!(args[0], "--stats");
+        assert_eq!(args[1], "-a");
+        assert_eq!(args[2], "/src");
+        assert_eq!(args[3], "deploy@server:/dst");
+        assert!(!args.iter().any(|a| a.starts_with("--rsh=")));
+    }
+
+    #[test]
+    fn build_direct_args_pull_has_no_rsh() {
+        let remote = RemoteSpec {
+            user: None,
+            host: "server".into(),
+            path: "/src".into(),
+        };
+        let args = build_direct_rsync_args(
+            &[],
+            &[PathBuf::from("/dst")],
+            &remote,
+            TransferDirection::Pull,
+        );
+
+        assert_eq!(args[0], "--stats");
+        assert_eq!(args[1], "server:/src");
+        assert_eq!(args[2], "/dst");
+        assert!(!args.iter().any(|a| a.starts_with("--rsh=")));
+    }
+
+    #[test]
     fn build_args_preserves_all_options() {
         let remote = RemoteSpec {
             user: Some("root".into()),
@@ -313,7 +409,12 @@ mod tests {
             path: "/".into(),
         };
         let options: Vec<String> = vec![
-            "-a", "-v", "-z", "--delete", "--exclude=*.tmp", "--progress",
+            "-a",
+            "-v",
+            "-z",
+            "--delete",
+            "--exclude=*.tmp",
+            "--progress",
         ]
         .into_iter()
         .map(String::from)
@@ -334,7 +435,10 @@ mod tests {
             assert_eq!(&args[i + 1], opt);
         }
         // --rsh 옵션이 사용자 옵션 뒤에 위치
-        assert!(args[options.len() + 1].starts_with("--rsh=") && args[options.len() + 1].ends_with(" --connect 9999"));
+        assert!(
+            args[options.len() + 1].starts_with("--rsh=")
+                && args[options.len() + 1].ends_with(" --connect 9999")
+        );
     }
 
     #[test]
@@ -406,5 +510,4 @@ mod tests {
             })?;
         }
     }
-
 }

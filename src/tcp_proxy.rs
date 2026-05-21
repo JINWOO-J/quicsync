@@ -72,7 +72,9 @@ impl TcpProxy {
                     Ok(n) => {
                         total_bytes += n as u64;
                         if tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
-                            tracing::debug!("tcp_proxy: tcp_read fwd_tx receiver dropped after {total_bytes} bytes");
+                            tracing::debug!(
+                                "tcp_proxy: tcp_read fwd_tx receiver dropped after {total_bytes} bytes"
+                            );
                             break Ok(()); // receiver dropped
                         }
                     }
@@ -92,11 +94,15 @@ impl TcpProxy {
                 chunk_count += 1;
                 total_bytes += data.len() as u64;
                 if let Err(e) = write_half.write_all(&data).await {
-                    tracing::error!("tcp_proxy: tcp_write write_all FAILED after {total_bytes} bytes ({chunk_count} chunks): {e}");
+                    tracing::error!(
+                        "tcp_proxy: tcp_write write_all FAILED after {total_bytes} bytes ({chunk_count} chunks): {e}"
+                    );
                     return Err(ProxyError::RelayError(format!("tcp write: {e}")));
                 }
             }
-            tracing::debug!("tcp_proxy: tcp_write channel closed after {total_bytes} bytes ({chunk_count} chunks), shutting down write half");
+            tracing::debug!(
+                "tcp_proxy: tcp_write channel closed after {total_bytes} bytes ({chunk_count} chunks), shutting down write half"
+            );
             let _ = write_half.shutdown().await;
             Ok(())
         });
@@ -152,9 +158,7 @@ mod tests {
         let (_quic_tx, quic_rx) = mpsc::channel::<Bytes>(16);
 
         // relay를 백그라운드에서 실행
-        let relay_handle = tokio::spawn(async move {
-            proxy.relay(tx, quic_rx).await
-        });
+        let relay_handle = tokio::spawn(async move { proxy.relay(tx, quic_rx).await });
 
         // rsync 역할: TCP 연결 후 데이터 전송
         let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
@@ -179,9 +183,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Bytes>(16);
         let (quic_tx, quic_rx) = mpsc::channel::<Bytes>(16);
 
-        let relay_handle = tokio::spawn(async move {
-            proxy.relay(tx, quic_rx).await
-        });
+        let relay_handle = tokio::spawn(async move { proxy.relay(tx, quic_rx).await });
 
         // rsync 역할: TCP 연결
         let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
@@ -189,7 +191,10 @@ mod tests {
             .unwrap();
 
         // QUIC 방향에서 데이터 전송
-        quic_tx.send(Bytes::from_static(b"hello from quic")).await.unwrap();
+        quic_tx
+            .send(Bytes::from_static(b"hello from quic"))
+            .await
+            .unwrap();
         drop(quic_tx); // 채널 종료 → write 루프 종료
 
         // TCP에서 데이터 수신 확인
@@ -208,9 +213,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Bytes>(16);
         let (quic_tx, quic_rx) = mpsc::channel::<Bytes>(16);
 
-        let relay_handle = tokio::spawn(async move {
-            proxy.relay(tx, quic_rx).await
-        });
+        let relay_handle = tokio::spawn(async move { proxy.relay(tx, quic_rx).await });
 
         let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
@@ -390,4 +393,3 @@ mod prop_tests {
         }
     }
 }
-

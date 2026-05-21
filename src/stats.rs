@@ -26,17 +26,22 @@ impl StatsReporter {
         eprintln!("--- quicsync transfer statistics ---");
         eprintln!("Total bytes: {}", s.bytes_transferred);
         eprintln!("Elapsed: {:.2}s", s.elapsed_secs);
-        eprintln!(
-            "Throughput: {:.2} Mbps",
-            s.throughput_bps / 1_000_000.0
-        );
-        eprintln!(
-            "RTT avg/min/max: {}us / {}us / {}us ({} samples)",
-            s.rtt.avg_us, s.rtt.min_us, s.rtt.max_us, s.rtt.count
-        );
-        eprintln!("Backpressure events: {}", s.backpressure_count);
-        eprintln!("Active streams: {}", s.streams_active);
-        eprintln!("Integrity checks: {}", s.integrity_checks);
+        eprintln!("Throughput: {:.2} Mbps", s.throughput_bps / 1_000_000.0);
+        if s.rtt.count > 0 {
+            eprintln!(
+                "RTT avg/min/max: {}us / {}us / {}us ({} samples)",
+                s.rtt.avg_us, s.rtt.min_us, s.rtt.max_us, s.rtt.count
+            );
+        }
+        if s.backpressure_count > 0 {
+            eprintln!("Backpressure events: {}", s.backpressure_count);
+        }
+        if s.streams_active > 0 {
+            eprintln!("Active streams: {}", s.streams_active);
+        }
+        if s.integrity_checks > 0 {
+            eprintln!("Integrity checks: {}", s.integrity_checks);
+        }
     }
 }
 
@@ -48,8 +53,7 @@ pub fn to_json(snapshot: &MetricsSnapshot) -> Result<String, StatsError> {
 
 /// JSON 문자열 → MetricsSnapshot
 pub fn from_json(json: &str) -> Result<MetricsSnapshot, StatsError> {
-    serde_json::from_str(json)
-        .map_err(|e| StatsError::DeserializationFailed(e.to_string()))
+    serde_json::from_str(json).map_err(|e| StatsError::DeserializationFailed(e.to_string()))
 }
 
 #[cfg(test)]
@@ -101,18 +105,53 @@ mod tests {
         assert!(text.contains("Backpressure"));
     }
 
+    #[test]
+    fn text_report_omits_placeholder_fields_without_samples() {
+        let snap = MetricsSnapshot {
+            bytes_transferred: 1_000,
+            total_bytes: 0,
+            elapsed_secs: 1.0,
+            throughput_bps: 8_000.0,
+            rtt: RttStats {
+                avg_us: 0,
+                min_us: 0,
+                max_us: 0,
+                count: 0,
+            },
+            backpressure_count: 0,
+            streams_active: 0,
+            integrity_checks: 0,
+        };
+        let text = format_text_report(&snap);
+        assert!(!text.contains("RTT"));
+        assert!(!text.contains("Backpressure"));
+        assert!(!text.contains("Active streams"));
+        assert!(!text.contains("Integrity checks"));
+    }
+
     /// 텍스트 리포트 생성 (테스트용)
     fn format_text_report(s: &MetricsSnapshot) -> String {
-        format!(
-            "Total bytes: {}\nElapsed: {:.2}s\nThroughput: {:.2} Mbps\nRTT avg/min/max: {}us / {}us / {}us\nBackpressure events: {}\nActive streams: {}\nIntegrity checks: {}",
-            s.bytes_transferred,
-            s.elapsed_secs,
-            s.throughput_bps / 1_000_000.0,
-            s.rtt.avg_us, s.rtt.min_us, s.rtt.max_us,
-            s.backpressure_count,
-            s.streams_active,
-            s.integrity_checks,
-        )
+        let mut lines = vec![
+            format!("Total bytes: {}", s.bytes_transferred),
+            format!("Elapsed: {:.2}s", s.elapsed_secs),
+            format!("Throughput: {:.2} Mbps", s.throughput_bps / 1_000_000.0),
+        ];
+        if s.rtt.count > 0 {
+            lines.push(format!(
+                "RTT avg/min/max: {}us / {}us / {}us",
+                s.rtt.avg_us, s.rtt.min_us, s.rtt.max_us
+            ));
+        }
+        if s.backpressure_count > 0 {
+            lines.push(format!("Backpressure events: {}", s.backpressure_count));
+        }
+        if s.streams_active > 0 {
+            lines.push(format!("Active streams: {}", s.streams_active));
+        }
+        if s.integrity_checks > 0 {
+            lines.push(format!("Integrity checks: {}", s.integrity_checks));
+        }
+        lines.join("\n")
     }
 
     // Property 4: 텍스트 리포트 필수 필드 포함

@@ -17,9 +17,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 1. `ssh [user@]host quicsync --server` 명령어를 자식 프로세스로 실행
 /// 2. stdout에서 `QUICSYNC_READY <port> <token>` 핸드셰이크 라인을 파싱
 /// 3. SSH 프로세스는 터널로 유지 (종료하지 않음)
-pub async fn launch_remote_server(
-    remote: &RemoteSpec,
-) -> Result<SshHandshake, SshError> {
+pub async fn launch_remote_server(remote: &RemoteSpec) -> Result<SshHandshake, SshError> {
     let ssh_target = match &remote.user {
         Some(user) => format!("{}@{}", user, remote.host),
         None => remote.host.clone(),
@@ -34,9 +32,13 @@ pub async fn launch_remote_server(
         .spawn()
         .map_err(|e| SshError::ConnectionFailed(format!("failed to spawn ssh: {}", e)))?;
 
-    let stdout = child.stdout.take()
+    let stdout = child
+        .stdout
+        .take()
         .ok_or_else(|| SshError::ConnectionFailed("failed to capture stdout".into()))?;
-    let stderr = child.stderr.take()
+    let stderr = child
+        .stderr
+        .take()
         .ok_or_else(|| SshError::ConnectionFailed("failed to capture stderr".into()))?;
 
     let mut stdout_reader = BufReader::new(stdout);
@@ -121,9 +123,9 @@ pub fn parse_handshake(stdout_line: &str) -> Result<HandshakeInfo, SshError> {
         )));
     }
 
-    let port: u16 = parts[1].parse().map_err(|_| {
-        SshError::HandshakeParseFailed(format!("invalid port: '{}'", parts[1]))
-    })?;
+    let port: u16 = parts[1]
+        .parse()
+        .map_err(|_| SshError::HandshakeParseFailed(format!("invalid port: '{}'", parts[1])))?;
 
     if port == 0 {
         return Err(SshError::HandshakeParseFailed(

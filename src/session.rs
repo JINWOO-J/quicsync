@@ -6,10 +6,11 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::buffer::BufferLayer;
-use crate::error::SessionError;
+use crate::error::{SessionError, SshError};
 use crate::metrics::TransferMetrics;
 use crate::progress::ProgressUI;
-use crate::quic::{fingerprint_from_hex, QuicClientCfg, QuicTunnel};
+use crate::quic::{QuicClientCfg, QuicTunnel, fingerprint_from_hex};
+use crate::remote_install::RemoteInstaller;
 use crate::rsync::RsyncChild;
 use crate::ssh::launch_remote_server;
 use crate::stats::StatsReporter;
@@ -50,7 +51,10 @@ impl Session {
             crate::types::TransferDirection::Push => "push",
             crate::types::TransferDirection::Pull => "pull",
         };
-        eprintln!("quicsync: {} → {} ({})", remote_display, direction_label,
+        eprintln!(
+            "quicsync: {} → {} ({})",
+            remote_display,
+            direction_label,
             if args.local_paths.len() == 1 {
                 args.local_paths[0].display().to_string()
             } else {
@@ -60,9 +64,24 @@ impl Session {
 
         // 1. SSH로 원격 서버 실행
         tracing::info!("launching remote server via SSH...");
-        let handshake = launch_remote_server(&args.remote)
-            .await
-            .map_err(|e| SessionError::InitFailed(format!("SSH: {e}")))?;
+        let handshake = match launch_remote_server(&args.remote).await {
+            Ok(handshake) => handshake,
+            Err(SshError::BinaryNotFound(e)) if args.install_remote => {
+                eprintln!("quicsync: remote quicsync not found; installing current binary...");
+                let version = RemoteInstaller::install_current(&args.remote, "$HOME/.local/bin")
+                    .await
+                    .map_err(|install_err| {
+                        SessionError::InitFailed(format!(
+                            "remote install failed after binary-not-found ({e}): {install_err}"
+                        ))
+                    })?;
+                eprintln!("quicsync: installed remote {version}");
+                launch_remote_server(&args.remote)
+                    .await
+                    .map_err(|retry_err| SessionError::InitFailed(format!("SSH: {retry_err}")))?
+            }
+            Err(e) => return Err(SessionError::InitFailed(format!("SSH: {e}"))),
+        };
 
         let ssh_process = handshake.ssh_process;
         let host_port = format!("{}:{}", args.remote.host, handshake.remote_port);
@@ -74,8 +93,10 @@ impl Session {
 
         // 핸드셰이크에서 수신한 지문을 바이트로 변환
         let fingerprint = match &handshake.fingerprint {
-            Some(hex) => Some(fingerprint_from_hex(hex)
-                .map_err(|e| SessionError::InitFailed(format!("fingerprint: {e}")))?),
+            Some(hex) => Some(
+                fingerprint_from_hex(hex)
+                    .map_err(|e| SessionError::InitFailed(format!("fingerprint: {e}")))?,
+            ),
             None => None,
         };
 
@@ -153,7 +174,10 @@ impl Session {
         let reverse_buffer = BufferLayer::from_env();
         let rev_metrics = Some(metrics.clone());
         tokio::spawn(async move {
-            if let Err(e) = reverse_buffer.relay_reverse(recv_stream, rev_tx, rev_metrics).await {
+            if let Err(e) = reverse_buffer
+                .relay_reverse(recv_stream, rev_tx, rev_metrics)
+                .await
+            {
                 tracing::error!("reverse relay error: {e}");
             }
         });
@@ -179,8 +203,13 @@ impl Session {
         let mut signal_rx = install_signal_handlers()?;
 
         let Session {
-            mut ssh_process, tunnel, rsync, started_at,
-            metrics, show_stats, stats_format,
+            mut ssh_process,
+            tunnel,
+            rsync,
+            started_at,
+            metrics,
+            show_stats,
+            stats_format,
         } = self;
 
         tokio::select! {
@@ -258,9 +287,9 @@ pub fn install_signal_handlers() -> Result<watch::Receiver<bool>, SessionError> 
 
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
 
             tokio::select! {
                 _ = ctrl_c => {}
@@ -278,4 +307,3 @@ pub fn install_signal_handlers() -> Result<watch::Receiver<bool>, SessionError> 
 
     Ok(rx)
 }
-

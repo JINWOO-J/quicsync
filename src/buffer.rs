@@ -187,7 +187,9 @@ impl BufferLayer {
 
             if n == 0 {
                 // QUIC 스트림 종료
-                tracing::debug!("relay_reverse: QUIC recv_stream EOF after {total_bytes} bytes ({chunk_count} chunks)");
+                tracing::debug!(
+                    "relay_reverse: QUIC recv_stream EOF after {total_bytes} bytes ({chunk_count} chunks)"
+                );
                 return Ok(());
             }
 
@@ -541,4 +543,3 @@ mod tests {
         }
     }
 }
-

@@ -22,8 +22,14 @@ impl ProgressUI {
         loop {
             interval.tick().await;
 
-            let transferred = self.metrics.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed);
-            let total = self.metrics.total_bytes.load(std::sync::atomic::Ordering::Relaxed);
+            let transferred = self
+                .metrics
+                .bytes_transferred
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let total = self
+                .metrics
+                .total_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
             let speed = self.metrics.throughput_bps() / 8.0; // bytes/s
             let eta = self.metrics.eta_secs();
 

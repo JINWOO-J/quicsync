@@ -33,8 +33,15 @@ pub enum TransferDirection {
     Pull,
 }
 
+/// QUIC 초기화 실패 시 fallback 동작
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackMode {
+    None,
+    Rsync,
+}
+
 /// CLI 인수 파싱 결과
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CliArgs {
     pub local_paths: Vec<PathBuf>,
     pub remote: RemoteSpec,
@@ -44,16 +51,14 @@ pub struct CliArgs {
     pub quic_window: u64,
     /// 진행률 UI 표시 여부 (기본: TTY이면 true)
     pub show_progress: bool,
-    /// 동시 QUIC 스트림 수 (1-64, 기본: 1)
-    pub streams: u16,
     /// 전송 완료 후 통계 표시 여부
     pub stats: bool,
     /// 통계 출력 형식
     pub stats_format: StatsFormat,
-    /// OpenTelemetry OTLP 엔드포인트 URL
-    pub otel_endpoint: Option<String>,
-    /// Blake3 무결성 검증 비활성화
-    pub no_integrity: bool,
+    /// QUIC 초기화 실패 시 fallback 동작
+    pub fallback: FallbackMode,
+    /// 원격 quicsync가 없을 때 현재 로컬 바이너리를 원격에 설치하고 한 번 재시도
+    pub install_remote: bool,
 }
 
 /// 32바이트 랜덤 인증 토큰 (hex 인코딩 시 64자)
@@ -149,7 +154,8 @@ mod tests {
 
     #[test]
     fn auth_token_from_hex_invalid_chars() {
-        let result = AuthToken::from_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+        let result =
+            AuthToken::from_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
         assert!(result.is_err());
     }
 
