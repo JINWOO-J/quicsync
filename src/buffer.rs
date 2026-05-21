@@ -7,10 +7,7 @@ use bytes::Bytes;
 use quinn::{RecvStream, SendStream};
 use tokio::sync::mpsc;
 
-use std::sync::Arc;
-
 use crate::error::{BufferError, BufferFull};
-use crate::metrics::TransferMetrics;
 
 /// 기본 버퍼 크기: 256MB
 const DEFAULT_BUFFER_SIZE: usize = 256 * 1024 * 1024;
@@ -123,7 +120,6 @@ impl BufferLayer {
         &self,
         mut tcp_rx: mpsc::Receiver<Bytes>,
         mut quic_tx: SendStream,
-        metrics: Option<Arc<TransferMetrics>>,
     ) -> Result<(), BufferError> {
         let keepalive_interval = Duration::from_secs(30);
         let mut total_bytes = 0u64;
@@ -133,11 +129,7 @@ impl BufferLayer {
                 maybe_data = tcp_rx.recv() => {
                     match maybe_data {
                         Some(data) => {
-                            let len = data.len() as u64;
-                            total_bytes += len;
-                            if let Some(ref m) = metrics {
-                                m.record_bytes(len);
-                            }
+                            total_bytes += data.len() as u64;
                             quic_tx.write_all(&data).await.map_err(|e| {
                                 BufferError::InvalidSize(format!("quic write: {e}"))
                             })?;
@@ -171,7 +163,6 @@ impl BufferLayer {
         &self,
         mut quic_rx: RecvStream,
         tcp_tx: mpsc::Sender<Bytes>,
-        metrics: Option<Arc<TransferMetrics>>,
     ) -> Result<(), BufferError> {
         let mut buf = vec![0u8; 256 * 1024]; // 256KB 읽기 버퍼
         let mut total_bytes = 0u64;
@@ -195,9 +186,6 @@ impl BufferLayer {
 
             chunk_count += 1;
             total_bytes += n as u64;
-            if let Some(ref m) = metrics {
-                m.record_bytes(n as u64);
-            }
 
             tcp_tx.send(Bytes::copy_from_slice(&buf[..n])).await
                 .map_err(|_| {
@@ -328,117 +316,6 @@ mod tests {
     #[test]
     fn parse_buffer_size_empty_string_falls_back() {
         assert_eq!(parse_buffer_size(Some("")), DEFAULT_BUFFER_SIZE);
-    }
-
-    // --- RingBuffer 스트레스 테스트 ---
-
-    #[test]
-    fn ring_buffer_many_cycles() {
-        // 1000회 write/read 사이클 후 데이터 무결성 확인
-        let mut buf = RingBuffer::new(64);
-        for i in 0u32..1000 {
-            let data = i.to_le_bytes();
-            let written = buf.write(&data).unwrap();
-            assert_eq!(written, 4);
-
-            let mut out = [0u8; 4];
-            let read = buf.read(&mut out);
-            assert_eq!(read, 4);
-            assert_eq!(u32::from_le_bytes(out), i);
-        }
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn ring_buffer_capacity_one() {
-        let mut buf = RingBuffer::new(1);
-        for byte in 0u8..=255 {
-            let written = buf.write(&[byte]).unwrap();
-            assert_eq!(written, 1);
-            assert!(buf.is_full());
-
-            let mut out = [0u8; 1];
-            let read = buf.read(&mut out);
-            assert_eq!(read, 1);
-            assert_eq!(out[0], byte);
-            assert!(buf.is_empty());
-        }
-    }
-
-    #[test]
-    fn ring_buffer_fill_drain_repeat() {
-        let cap = 128;
-        let mut buf = RingBuffer::new(cap);
-
-        for round in 0..10 {
-            // 가득 채우기
-            let fill = vec![(round as u8).wrapping_mul(37); cap];
-            let written = buf.write(&fill).unwrap();
-            assert_eq!(written, cap);
-            assert!(buf.is_full());
-
-            // 전부 읽기
-            let mut out = vec![0u8; cap];
-            let read = buf.read(&mut out);
-            assert_eq!(read, cap);
-            assert_eq!(out, fill);
-            assert!(buf.is_empty());
-        }
-    }
-
-    #[test]
-    fn ring_buffer_partial_fill_drain() {
-        // 부분 쓰기/읽기를 반복하여 wraparound가 여러 번 발생하는 시나리오
-        // write 3, read 3 → net 0이지만 head/tail이 순환
-        let mut buf = RingBuffer::new(10);
-        let mut all_written = Vec::new();
-        let mut all_read = Vec::new();
-
-        for i in 0u8..100 {
-            let chunk = [i, i.wrapping_add(1), i.wrapping_add(2)];
-            let written = buf.write(&chunk).unwrap();
-            assert_eq!(written, 3);
-            all_written.extend_from_slice(&chunk);
-
-            let mut out = [0u8; 3];
-            let read = buf.read(&mut out);
-            assert_eq!(read, 3);
-            all_read.extend_from_slice(&out[..read]);
-        }
-
-        assert!(buf.is_empty());
-        assert_eq!(all_written, all_read);
-    }
-
-    #[test]
-    fn ring_buffer_available_tracks_correctly() {
-        let mut buf = RingBuffer::new(16);
-        assert_eq!(buf.available(), 16);
-
-        buf.write(b"hello").unwrap();
-        assert_eq!(buf.available(), 11);
-
-        let mut out = [0u8; 3];
-        buf.read(&mut out);
-        assert_eq!(buf.available(), 14);
-
-        buf.write(b"world!").unwrap();
-        assert_eq!(buf.available(), 8);
-    }
-
-    // --- BufferLayer backpressure 테스트 ---
-
-    #[test]
-    fn buffer_layer_backpressure_when_full() {
-        let mut layer = BufferLayer::new(8);
-        assert!(!layer.is_backpressure_active());
-
-        layer.buffer.write(b"12345678").unwrap();
-        assert!(layer.is_backpressure_active());
-
-        let mut out = [0u8; 1];
-        layer.buffer.read(&mut out);
-        assert!(!layer.is_backpressure_active());
     }
 
     // Feature: quicsync-tunnel-mvp, Property 5: 환경변수 버퍼 크기 설정

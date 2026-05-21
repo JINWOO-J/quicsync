@@ -41,6 +41,9 @@ else
 endif
 
 # 개별 타겟 빌드
+release-arm-mac:
+	cargo build --release --target aarch64-apple-darwin
+
 release-x86-mac:
 	cargo build --release --target x86_64-apple-darwin
 
@@ -53,7 +56,11 @@ release-arm-linux:
 # 전체 릴리스: native + 가능한 cross 타겟
 release-all: release
 ifeq ($(UNAME_S),Darwin)
-	@# macOS: x86 mac은 rustup, Linux 타겟은 cross
+	@# macOS: x86/arm mac은 rustup, Linux 타겟은 cross
+	@if rustup target list --installed | grep -q aarch64-apple-darwin; then \
+		echo "Building aarch64-apple-darwin..."; \
+		cargo build --release --target aarch64-apple-darwin; \
+	fi
 	@if rustup target list --installed | grep -q x86_64-apple-darwin; then \
 		echo "Building x86_64-apple-darwin..."; \
 		cargo build --release --target x86_64-apple-darwin; \
@@ -92,7 +99,7 @@ bump:
 dist: bump release-all
 	mkdir -p $(DIST_DIR)
 	@cp -f target/release/quicsync $(DIST_DIR)/quicsync-$(UNAME_S)-native 2>/dev/null || true
-	@for target in x86_64-apple-darwin $(LINUX_TARGETS); do \
+	@for target in aarch64-apple-darwin x86_64-apple-darwin $(LINUX_TARGETS); do \
 		if [ -f target/$$target/release/quicsync ]; then \
 			cp target/$$target/release/quicsync $(DIST_DIR)/quicsync-$$target; \
 			echo "Copied quicsync-$$target"; \

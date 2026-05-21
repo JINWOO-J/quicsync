@@ -1,3 +1,7 @@
+// quicsync는 Linux와 macOS만 지원한다.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("quicsync only supports Linux and macOS");
+
 pub mod buffer;
 pub mod cli;
 pub mod doctor;
@@ -14,6 +18,8 @@ pub mod session;
 pub mod ssh;
 pub mod stats;
 pub mod tcp_proxy;
-pub mod telemetry;
 pub mod types;
 pub mod update;
+
+#[cfg(feature = "otel")]
+pub mod telemetry;

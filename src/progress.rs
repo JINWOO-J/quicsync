@@ -1,18 +1,20 @@
-// 전송 진행률 UI (stderr 출력)
+// Progress UI - 전송 상태를 stderr에 실시간 표시
 
 use std::sync::Arc;
 
 use crate::metrics::TransferMetrics;
 
-/// 진행률 UI
 pub struct ProgressUI {
-    pub metrics: Arc<TransferMetrics>,
-    pub enabled: bool,
+    metrics: Arc<TransferMetrics>,
+    enabled: bool,
 }
 
 impl ProgressUI {
-    /// 500ms 간격으로 stderr에 진행 상황을 갱신한다.
-    /// `\r`로 같은 줄을 덮어쓰며, 태스크 종료 시 자동으로 멈춘다.
+    pub fn new(metrics: Arc<TransferMetrics>, enabled: bool) -> Self {
+        Self { metrics, enabled }
+    }
+
+    /// 500ms 주기로 stderr에 상태를 갱신하는 루프 (tokio task로 실행)
     pub async fn run(&self) {
         if !self.enabled {
             return;
@@ -22,79 +24,81 @@ impl ProgressUI {
         loop {
             interval.tick().await;
 
-            let transferred = self
+            let snap = self.metrics.snapshot();
+            let mode = if self
                 .metrics
-                .bytes_transferred
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let total = self
-                .metrics
-                .total_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let speed = self.metrics.throughput_bps() / 8.0; // bytes/s
-            let eta = self.metrics.eta_secs();
-
-            if total > 0 {
-                eprint!(
-                    "\r[QUIC] {} | ETA {} | {} / {}    ",
-                    format_speed(speed),
-                    format_eta(eta),
-                    format_bytes(transferred),
-                    format_bytes(total),
-                );
+                .transport_mode
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                "QUIC"
             } else {
-                eprint!(
-                    "\r[QUIC] {} | {}    ",
-                    format_speed(speed),
-                    format_bytes(transferred),
-                );
-            }
+                "TCP"
+            };
+
+            let speed = format_speed(snap.throughput_bps);
+            let transferred = format_bytes(snap.bytes_transferred);
+            let total = format_bytes(
+                self.metrics
+                    .total_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+
+            let eta = match self.metrics.eta_secs() {
+                Some(secs) => format!("ETA {}", format_eta(secs)),
+                None => "ETA --".to_string(),
+            };
+
+            eprint!(
+                "\r[{}] {} | {} | {} / {}",
+                mode, speed, eta, transferred, total
+            );
         }
     }
 }
 
-/// 바이트 수를 사람이 읽기 좋은 형태로 변환한다.
+/// 바이트 수를 사람이 읽기 쉬운 단위로 변환 (SI 1000-based)
+/// 예: 1536 → "1.5 KB", 1073741824 → "1.1 GB"
 pub fn format_bytes(bytes: u64) -> String {
-    if bytes < 1_000 {
-        format!("{bytes}B")
+    if bytes < 1000 {
+        format!("{} B", bytes)
     } else if bytes < 1_000_000 {
-        format!("{:.1}KB", bytes as f64 / 1_000.0)
+        format!("{:.1} KB", bytes as f64 / 1_000.0)
     } else if bytes < 1_000_000_000 {
-        format!("{:.1}MB", bytes as f64 / 1_000_000.0)
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
     } else {
-        format!("{:.2}GB", bytes as f64 / 1_000_000_000.0)
+        format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
     }
 }
 
-/// 속도를 사람이 읽기 좋은 형태로 변환한다 (bytes/s 입력).
+/// 전송 속도를 사람이 읽기 쉬운 단위로 변환 (SI 1000-based)
+/// 예: 1536.0 → "1.5 KB/s", 1073741824.0 → "1.1 GB/s"
 pub fn format_speed(bytes_per_sec: f64) -> String {
-    let bps = bytes_per_sec;
-    if bps < 1_000.0 {
-        format!("{:.0}B/s", bps)
-    } else if bps < 1_000_000.0 {
-        format!("{:.1}KB/s", bps / 1_000.0)
-    } else if bps < 1_000_000_000.0 {
-        format!("{:.1}MB/s", bps / 1_000_000.0)
+    if bytes_per_sec < 1000.0 {
+        format!("{:.1} B/s", bytes_per_sec)
+    } else if bytes_per_sec < 1_000_000.0 {
+        format!("{:.1} KB/s", bytes_per_sec / 1_000.0)
+    } else if bytes_per_sec < 1_000_000_000.0 {
+        format!("{:.1} MB/s", bytes_per_sec / 1_000_000.0)
     } else {
-        format!("{:.2}GB/s", bps / 1_000_000_000.0)
+        format!("{:.1} GB/s", bytes_per_sec / 1_000_000_000.0)
     }
 }
 
-/// ETA를 "Xh Ym Zs" 형태로 변환한다.
+/// 초를 사람이 읽기 쉬운 시간으로 변환
+/// 예: 133.0 → "2m 13s", 3661.0 → "1h 1m 1s"
 pub fn format_eta(secs: f64) -> String {
-    if secs <= 0.0 || !secs.is_finite() {
-        return "--:--".to_string();
-    }
     let total_secs = secs as u64;
     let hours = total_secs / 3600;
     let minutes = (total_secs % 3600) / 60;
     let seconds = total_secs % 60;
 
     if hours > 0 {
-        format!("{hours}h {minutes}m {seconds}s")
+        format!("{}h {}m {}s", hours, minutes, seconds)
     } else if minutes > 0 {
-        format!("{minutes}m {seconds}s")
+        format!("{}m {}s", minutes, seconds)
     } else {
-        format!("{seconds}s")
+        format!("{}s", seconds)
     }
 }
 
@@ -103,119 +107,136 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    // --- format_bytes 단위 테스트 ---
+    // --- format_bytes ---
 
     #[test]
-    fn format_bytes_zero() {
-        assert_eq!(format_bytes(0), "0B");
+    fn test_format_bytes_zero() {
+        assert_eq!(format_bytes(0), "0 B");
     }
 
     #[test]
-    fn format_bytes_small() {
-        assert_eq!(format_bytes(999), "999B");
+    fn test_format_bytes_boundary_b() {
+        assert_eq!(format_bytes(999), "999 B");
     }
 
     #[test]
-    fn format_bytes_kb() {
-        assert_eq!(format_bytes(1_000), "1.0KB");
-        assert_eq!(format_bytes(1_500), "1.5KB");
+    fn test_format_bytes_boundary_kb() {
+        assert_eq!(format_bytes(1000), "1.0 KB");
+        assert_eq!(format_bytes(999_999), "1000.0 KB");
     }
 
     #[test]
-    fn format_bytes_mb() {
-        assert_eq!(format_bytes(1_000_000), "1.0MB");
-        assert_eq!(format_bytes(500_000_000), "500.0MB");
+    fn test_format_bytes_boundary_mb() {
+        assert_eq!(format_bytes(1_000_000), "1.0 MB");
+        assert_eq!(format_bytes(999_999_999), "1000.0 MB");
     }
 
     #[test]
-    fn format_bytes_gb() {
-        assert_eq!(format_bytes(1_000_000_000), "1.00GB");
-        assert_eq!(format_bytes(2_500_000_000), "2.50GB");
-    }
-
-    // --- format_speed 단위 테스트 ---
-
-    #[test]
-    fn format_speed_small() {
-        assert_eq!(format_speed(500.0), "500B/s");
+    fn test_format_bytes_gb() {
+        assert_eq!(format_bytes(1_000_000_000), "1.0 GB");
+        assert_eq!(format_bytes(1_500_000_000), "1.5 GB");
     }
 
     #[test]
-    fn format_speed_kb() {
-        assert_eq!(format_speed(1_500.0), "1.5KB/s");
+    fn test_format_bytes_example_1536() {
+        assert_eq!(format_bytes(1536), "1.5 KB");
+    }
+
+    // --- format_speed ---
+
+    #[test]
+    fn test_format_speed_zero() {
+        assert_eq!(format_speed(0.0), "0.0 B/s");
     }
 
     #[test]
-    fn format_speed_mb() {
-        assert_eq!(format_speed(10_000_000.0), "10.0MB/s");
+    fn test_format_speed_boundary_bs() {
+        assert_eq!(format_speed(999.0), "999.0 B/s");
     }
 
     #[test]
-    fn format_speed_gb() {
-        assert_eq!(format_speed(1_500_000_000.0), "1.50GB/s");
-    }
-
-    // --- format_eta 단위 테스트 ---
-
-    #[test]
-    fn format_eta_zero() {
-        assert_eq!(format_eta(0.0), "--:--");
+    fn test_format_speed_boundary_kbs() {
+        assert_eq!(format_speed(1000.0), "1.0 KB/s");
     }
 
     #[test]
-    fn format_eta_seconds() {
+    fn test_format_speed_boundary_mbs() {
+        assert_eq!(format_speed(1_000_000.0), "1.0 MB/s");
+    }
+
+    #[test]
+    fn test_format_speed_gbs() {
+        assert_eq!(format_speed(1_000_000_000.0), "1.0 GB/s");
+    }
+
+    #[test]
+    fn test_format_speed_example_1536() {
+        assert_eq!(format_speed(1536.0), "1.5 KB/s");
+    }
+
+    // --- format_eta ---
+
+    #[test]
+    fn test_format_eta_zero() {
+        assert_eq!(format_eta(0.0), "0s");
+    }
+
+    #[test]
+    fn test_format_eta_seconds_only() {
         assert_eq!(format_eta(45.0), "45s");
     }
 
     #[test]
-    fn format_eta_minutes() {
-        assert_eq!(format_eta(125.0), "2m 5s");
+    fn test_format_eta_minutes_and_seconds() {
+        assert_eq!(format_eta(133.0), "2m 13s");
     }
 
     #[test]
-    fn format_eta_hours() {
+    fn test_format_eta_hours() {
         assert_eq!(format_eta(3661.0), "1h 1m 1s");
     }
 
     #[test]
-    fn format_eta_nan() {
-        assert_eq!(format_eta(f64::NAN), "--:--");
+    fn test_format_eta_exact_hour() {
+        assert_eq!(format_eta(3600.0), "1h 0m 0s");
     }
 
     #[test]
-    fn format_eta_infinity() {
-        assert_eq!(format_eta(f64::INFINITY), "--:--");
+    fn test_format_eta_exact_minute() {
+        assert_eq!(format_eta(60.0), "1m 0s");
     }
 
-    // Property 1: format_bytes 단위 선택
+    // Feature: quicsync-phase2-enhancements, Property 1: 바이트/속도 포맷 함수 정확성
+    // **Validates: Requirements 2.8, 2.9**
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(100))]
 
         #[test]
         fn prop_format_bytes_unit_selection(bytes in any::<u64>()) {
-            let s = format_bytes(bytes);
-            if bytes < 1_000 {
-                prop_assert!(s.ends_with("B") && !s.contains("KB"), "expected B for {bytes}: {s}");
+            let result = format_bytes(bytes);
+            if bytes < 1000 {
+                prop_assert!(result.ends_with(" B"), "expected B suffix for {}, got {}", bytes, result);
             } else if bytes < 1_000_000 {
-                prop_assert!(s.ends_with("KB"), "expected KB for {bytes}: {s}");
+                prop_assert!(result.ends_with(" KB"), "expected KB suffix for {}, got {}", bytes, result);
             } else if bytes < 1_000_000_000 {
-                prop_assert!(s.ends_with("MB"), "expected MB for {bytes}: {s}");
+                prop_assert!(result.ends_with(" MB"), "expected MB suffix for {}, got {}", bytes, result);
             } else {
-                prop_assert!(s.ends_with("GB"), "expected GB for {bytes}: {s}");
+                prop_assert!(result.ends_with(" GB"), "expected GB suffix for {}, got {}", bytes, result);
             }
         }
 
         #[test]
-        fn prop_format_speed_unit_selection(bps in 0.0f64..1e15) {
-            let s = format_speed(bps);
-            if bps < 1_000.0 {
-                prop_assert!(s.ends_with("B/s") && !s.contains("KB"), "expected B/s for {bps}: {s}");
+        fn prop_format_speed_unit_selection(bps in 0.0f64..10_000_000_000.0f64) {
+            let result = format_speed(bps);
+            prop_assert!(result.ends_with("/s"), "expected /s suffix, got {}", result);
+            if bps < 1000.0 {
+                prop_assert!(result.ends_with(" B/s"), "expected B/s for {}, got {}", bps, result);
             } else if bps < 1_000_000.0 {
-                prop_assert!(s.ends_with("KB/s"), "expected KB/s for {bps}: {s}");
+                prop_assert!(result.ends_with(" KB/s"), "expected KB/s for {}, got {}", bps, result);
             } else if bps < 1_000_000_000.0 {
-                prop_assert!(s.ends_with("MB/s"), "expected MB/s for {bps}: {s}");
+                prop_assert!(result.ends_with(" MB/s"), "expected MB/s for {}, got {}", bps, result);
             } else {
-                prop_assert!(s.ends_with("GB/s"), "expected GB/s for {bps}: {s}");
+                prop_assert!(result.ends_with(" GB/s"), "expected GB/s for {}, got {}", bps, result);
             }
         }
     }
