@@ -83,7 +83,7 @@ async fn run_install_remote(raw_args: &[String]) -> ExitCode {
         }
     };
 
-    match RemoteInstaller::install_current(&args.remote, &args.install_dir).await {
+    match RemoteInstaller::install_smart(&args.remote, &args.install_dir).await {
         Ok(version) => {
             eprintln!("quicsync install-remote: installed {version}");
             ExitCode::SUCCESS

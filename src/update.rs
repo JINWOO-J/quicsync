@@ -180,7 +180,7 @@ fn is_cargo_install_path(path: &Path) -> bool {
     false
 }
 
-fn asset_name(os: &str, arch: &str) -> Option<String> {
+pub fn asset_name(os: &str, arch: &str) -> Option<String> {
     match (os, arch) {
         ("linux", "x86_64" | "aarch64") | ("macos", "x86_64" | "aarch64") => {
             Some(format!("quicsync_{os}_{arch}.tar.gz"))
@@ -211,10 +211,24 @@ async fn latest_tag() -> Result<String, String> {
 }
 
 async fn download_verified(install: &Install, tag: &str) -> Result<PathBuf, String> {
-    let asset = asset_name(install.os, install.arch)
-        .ok_or_else(|| format!("unsupported platform: {}/{}", install.os, install.arch))?;
     let staging_dir = pick_staging_dir(&install.dir);
-    let workdir = tempfile_dir(&staging_dir)?;
+    download_release_binary(install.os, install.arch, tag, &staging_dir).await
+}
+
+/// 지정한 os/arch/tag의 릴리즈 자산을 다운로드·체크섬 검증·해제하여
+/// staged 바이너리 경로를 반환한다. self-update와 원격 설치(install-remote)가 공유한다.
+///
+/// - `os`/`arch`: `std::env::consts` 표기 (linux|macos, x86_64|aarch64)
+/// - `tag`: 릴리즈 태그 (예: `v0.3.0`)
+/// - `staging_dir`: 작업 디렉토리를 만들 부모 경로 (원격 설치는 보통 임시 디렉토리)
+pub async fn download_release_binary(
+    os: &str,
+    arch: &str,
+    tag: &str,
+    staging_dir: &Path,
+) -> Result<PathBuf, String> {
+    let asset = asset_name(os, arch).ok_or_else(|| format!("unsupported platform: {os}/{arch}"))?;
+    let workdir = tempfile_dir(staging_dir)?;
     let archive = workdir.join(&asset);
     let checksums = workdir.join("checksums.txt");
     let base = format!("https://github.com/{DEFAULT_REPO}/releases/download/{tag}");

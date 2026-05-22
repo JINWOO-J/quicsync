@@ -96,8 +96,8 @@ impl Session {
         let handshake = match launch_remote_server(&args.remote).await {
             Ok(handshake) => handshake,
             Err(SshError::BinaryNotFound(e)) if args.install_remote => {
-                eprintln!("quicsync: remote quicsync not found; installing current binary...");
-                let version = RemoteInstaller::install_current(&args.remote, "$HOME/.local/bin")
+                eprintln!("quicsync: remote quicsync not found; installing matching binary...");
+                let version = RemoteInstaller::install_smart(&args.remote, "$HOME/.local/bin")
                     .await
                     .map_err(|install_err| {
                         SessionError::InitFailed(format!(
