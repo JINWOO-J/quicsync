@@ -58,6 +58,8 @@ pub struct CliArgs {
     pub fallback: FallbackMode,
     /// 원격 quicsync가 없을 때 현재 로컬 바이너리를 원격에 설치하고 한 번 재시도
     pub install_remote: bool,
+    /// --web: 전송 중 127.0.0.1에 실시간 모니터링 웹 서버를 띄운다
+    pub web: bool,
 }
 
 /// 32바이트 랜덤 인증 토큰 (hex 인코딩 시 64자)

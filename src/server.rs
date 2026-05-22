@@ -139,7 +139,7 @@ impl RemoteServer {
             .await
             .map_err(|e| ServerError::RelayError(format!("read args: {e}")))?;
 
-        let rsync_args: Vec<&str> = args_line.trim().split_whitespace().collect();
+        let rsync_args: Vec<&str> = args_line.split_whitespace().collect();
 
         // 5. rsync 서버 프로세스 spawn (stdin/stdout 파이프)
         let mut child = Command::new("rsync")

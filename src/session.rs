@@ -1,6 +1,7 @@
 // 전체 세션 생명주기 관리 및 시그널 핸들링
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::watch;
@@ -27,6 +28,10 @@ pub struct Session {
     streams: u8,
     stats: bool,
     stats_format: StatsFormat,
+    /// --web 활성 시 실행되는 모니터링 task들(서버 + 로그 tail). 전송 종료 시 abort된다.
+    web_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// --web 파일 이벤트 로그 임시 경로. 종료 시 삭제한다.
+    web_log_path: Option<std::path::PathBuf>,
     #[cfg(feature = "otel")]
     telemetry: Option<crate::telemetry::TelemetryExporter>,
 }
@@ -155,12 +160,22 @@ impl Session {
         tracing::info!("TCP proxy listening on 127.0.0.1:{}", proxy_port);
 
         // 5. rsync 자식 프로세스 실행
+        // --web이면 파일 이벤트 로그 임시 경로를 만들어 rsync가 기록하게 한다.
+        let web_log_path = if args.web {
+            let p = std::env::temp_dir().join(format!("quicsync-web-{}.log", std::process::id()));
+            // tail이 곧바로 열 수 있도록 빈 파일을 생성한다(기존 내용 제거).
+            let _ = std::fs::File::create(&p);
+            Some(p)
+        } else {
+            None
+        };
         let rsync = RsyncChild::spawn(
             &args.rsync_options,
             &args.local_paths,
             &args.remote,
             proxy_port,
             args.direction,
+            web_log_path.as_deref(),
         )
         .map_err(|e| SessionError::InitFailed(format!("rsync: {e}")))?;
 
@@ -177,16 +192,21 @@ impl Session {
         });
 
         // Buffer forward relay: 채널 → QUIC SendStream
+        let fwd_metrics = metrics.clone();
         tokio::spawn(async move {
-            if let Err(e) = buffer.relay_forward(fwd_rx, send_stream).await {
+            if let Err(e) = buffer.relay_forward(fwd_rx, send_stream, fwd_metrics).await {
                 tracing::error!("forward relay error: {e}");
             }
         });
 
         // Buffer reverse relay: QUIC RecvStream → 채널
         let reverse_buffer = BufferLayer::from_env();
+        let rev_metrics = metrics.clone();
         tokio::spawn(async move {
-            if let Err(e) = reverse_buffer.relay_reverse(recv_stream, rev_tx).await {
+            if let Err(e) = reverse_buffer
+                .relay_reverse(recv_stream, rev_tx, rev_metrics)
+                .await
+            {
                 tracing::error!("reverse relay error: {e}");
             }
         });
@@ -197,6 +217,47 @@ impl Session {
         if args.show_progress {
             let progress = ProgressUI::new(metrics.clone(), true);
             tokio::spawn(async move { progress.run().await });
+        }
+
+        // Web 모니터링 서버 + 보조 task 스폰 (--web 활성 시).
+        // 127.0.0.1 ephemeral 포트에 바인딩하고 URL을 출력한 뒤 브라우저를 연다.
+        // 바인딩/브라우저 오픈 실패는 비치명적이며 전송은 정상 진행한다.
+        let mut web_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        if args.web {
+            match crate::web::bind().await {
+                Ok((listener, addr)) => {
+                    let url = format!("http://{addr}");
+                    eprintln!("quicsync: web monitor → {url}");
+                    open_browser(&url);
+                    let web_metrics = metrics.clone();
+                    web_tasks.push(tokio::spawn(async move {
+                        crate::web::serve(listener, web_metrics).await;
+                    }));
+                }
+                Err(e) => {
+                    eprintln!("quicsync: web monitor disabled (bind failed: {e})");
+                }
+            }
+
+            // 파일 이벤트 로그 tail: 완료 파일 수와 현재 파일명을 갱신한다.
+            if let Some(ref log_path) = web_log_path {
+                let tail_metrics = metrics.clone();
+                let lp = log_path.clone();
+                web_tasks.push(tokio::spawn(tail_file_log(lp, tail_metrics)));
+            }
+
+            // Push는 로컬 소스를 미리 walk하여 전체 파일 수(진행률 분모)를 산정한다.
+            // (rsync 필터는 미반영하므로 근사치. Pull은 원격이라 산정 불가 → 0=미상.)
+            if args.direction == crate::types::TransferDirection::Push {
+                let walk_metrics = metrics.clone();
+                let paths = args.local_paths.clone();
+                tokio::task::spawn_blocking(move || {
+                    let n = count_files(&paths);
+                    walk_metrics
+                        .total_files
+                        .store(n, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
         }
 
         let streams = args.streams;
@@ -215,6 +276,8 @@ impl Session {
             streams,
             stats,
             stats_format,
+            web_tasks,
+            web_log_path,
             #[cfg(feature = "otel")]
             telemetry,
         })
@@ -236,6 +299,8 @@ impl Session {
             streams,
             stats,
             stats_format,
+            web_tasks,
+            web_log_path,
             #[cfg(feature = "otel")]
             telemetry,
         } = self;
@@ -257,6 +322,7 @@ impl Session {
                     }
                 };
                 shutdown(tunnel, &mut ssh_process).await;
+                cleanup_web(&web_tasks, &web_log_path);
                 let elapsed = started_at.elapsed();
 
                 // Stats 리포트 출력 (--stats 플래그 활성 시)
@@ -294,6 +360,7 @@ impl Session {
             _ = signal_rx.changed() => {
                 tracing::warn!("signal received, aborting session...");
                 abort(tunnel, &mut ssh_process).await;
+                cleanup_web(&web_tasks, &web_log_path);
 
                 #[cfg(feature = "otel")]
                 if let Some(telem) = telemetry {
@@ -329,6 +396,95 @@ async fn abort(tunnel: QuicTunnel, ssh_process: &mut tokio::process::Child) {
     let _ = ssh_process.kill().await;
 
     tracing::info!("session abort complete");
+}
+
+/// --web task들을 abort하고 임시 로그 파일을 삭제한다.
+fn cleanup_web(tasks: &[tokio::task::JoinHandle<()>], log_path: &Option<PathBuf>) {
+    for t in tasks {
+        t.abort();
+    }
+    if let Some(p) = log_path {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// rsync `--log-file`을 주기적으로 tail하여 완료 파일 수와 현재 파일명을 갱신한다.
+/// 파일 경계(파일당 1줄)에서만 동작하므로 데이터 전송 성능에 영향을 주지 않는다.
+async fn tail_file_log(path: PathBuf, metrics: Arc<TransferMetrics>) {
+    use std::io::SeekFrom;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let mut offset: u64 = 0;
+    let mut pending = String::new();
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if file.seek(SeekFrom::Start(offset)).await.is_err() {
+            continue;
+        }
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).await.is_err() || buf.is_empty() {
+            continue;
+        }
+        offset += buf.len() as u64;
+        pending.push_str(&String::from_utf8_lossy(&buf));
+
+        while let Some(nl) = pending.find('\n') {
+            let line: String = pending.drain(..=nl).collect();
+            if let Some(item) = crate::rsync::parse_log_file_line(line.trim_end())
+                && item.is_file
+            {
+                metrics
+                    .completed_files
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(mut cur) = metrics.current_file.lock() {
+                    *cur = item.name;
+                }
+            }
+        }
+    }
+}
+
+/// 경로 목록의 일반 파일 수를 재귀적으로 센다(진행률 분모 산정용 근사치).
+fn count_files(paths: &[PathBuf]) -> u64 {
+    paths.iter().map(|p| count_path(p)).sum()
+}
+
+/// 심볼릭 링크는 따라가지 않아 순환을 방지하고, 일반 파일만 1로 센다.
+fn count_path(p: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(p) else {
+        return 0;
+    };
+    if meta.is_file() {
+        1
+    } else if meta.is_dir() {
+        std::fs::read_dir(p)
+            .map(|entries| entries.flatten().map(|e| count_path(&e.path())).sum())
+            .unwrap_or(0)
+    } else {
+        0 // 심볼릭 링크/특수 파일은 제외
+    }
+}
+
+/// 기본 브라우저로 URL을 연다. quicsync는 Linux/macOS만 지원하므로
+/// macOS는 `open`, Linux는 `xdg-open`을 사용한다. 실패는 비치명적이다(URL은 이미 출력됨).
+fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "linux")]
+    let program = "xdg-open";
+
+    let _ = std::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 /// SIGINT/SIGTERM 시그널 핸들러를 등록한다.

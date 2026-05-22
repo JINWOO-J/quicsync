@@ -124,6 +124,7 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
     let mut no_integrity = false;
     let mut fallback = FallbackMode::None;
     let mut install_remote = false;
+    let mut web = false;
     let mut remaining: Vec<&str> = Vec::new();
     let mut iter = trailing.iter();
     while let Some(arg) = iter.next() {
@@ -174,6 +175,7 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
                 fallback = parse_fallback_mode(val)?;
             }
             "--install-remote" => install_remote = true,
+            "--web" => web = true,
             _ if arg.starts_with("--window=") => {
                 window_mb = Some(parse_window_mb(arg.strip_prefix("--window=").unwrap())?);
             }
@@ -212,7 +214,7 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
 
     // --streams 범위 검증 (1-64)
     let streams = streams.unwrap_or(4);
-    if streams < 1 || streams > 64 {
+    if !(1..=64).contains(&streams) {
         return Err(CliError::InvalidArgs(format!(
             "invalid value '{streams}' for --streams: must be between 1 and 64"
         )));
@@ -285,6 +287,7 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
             no_integrity,
             fallback,
             install_remote,
+            web,
         })
     } else {
         // Pull: SRC 중 하나가 원격, DST가 로컬
@@ -313,6 +316,7 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
             no_integrity,
             fallback,
             install_remote,
+            web,
         })
     }
 }
@@ -479,6 +483,21 @@ mod tests {
         assert!(!cli.no_integrity);
         assert_eq!(cli.fallback, FallbackMode::None);
         assert!(!cli.install_remote);
+        assert!(!cli.web);
+    }
+
+    #[test]
+    fn parse_args_web_flag() {
+        let a = args(&["quicsync", "--web", "/src", "host:/dst"]);
+        let cli = parse_args(&a).unwrap();
+        assert!(cli.web);
+    }
+
+    #[test]
+    fn parse_args_web_flag_default_false() {
+        let a = args(&["quicsync", "/src", "host:/dst"]);
+        let cli = parse_args(&a).unwrap();
+        assert!(!cli.web);
     }
 
     #[test]

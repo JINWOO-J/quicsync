@@ -2,3 +2,7 @@
 /dist
 bench/results.csv
 bench/latency_sweep.csv
+
+# 에이전트 상태/메타데이터 (커밋 금지)
+/.omc/
+/.xm/

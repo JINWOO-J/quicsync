@@ -8,7 +8,7 @@ use quicsync::types::AuthToken;
 /// AuthToken::generate() 성능 — 암호학적 RNG 호출 포함
 fn bench_generate(c: &mut Criterion) {
     c.bench_function("auth_token/generate", |b| {
-        b.iter(|| AuthToken::generate());
+        b.iter(AuthToken::generate);
     });
 }
 

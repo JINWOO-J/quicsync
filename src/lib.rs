@@ -20,6 +20,7 @@ pub mod stats;
 pub mod tcp_proxy;
 pub mod types;
 pub mod update;
+pub mod web;
 
 #[cfg(feature = "otel")]
 pub mod telemetry;

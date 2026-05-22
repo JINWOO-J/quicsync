@@ -120,7 +120,7 @@ dist: release-all
 	package target/aarch64-unknown-linux-gnu/release/quicsync quicsync_linux_aarch64.tar.gz; \
 	package target/x86_64-apple-darwin/release/quicsync quicsync_macos_x86_64.tar.gz; \
 	if [ "$(UNAME_S)" = "Darwin" ]; then \
-		arch=$$(uname -m); \
+		arch=$$(uname -m); [ "$$arch" = "arm64" ] && arch=aarch64; \
 		package target/release/quicsync quicsync_macos_$$arch.tar.gz; \
 	fi
 	@if ls $(DIST_DIR)/quicsync_*.tar.gz >/dev/null 2>&1; then \

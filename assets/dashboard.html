@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>quicsync monitor</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #2f81f7;
+    --ok: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  header {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .mode {
+    margin-left: auto;
+    padding: 4px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--accent);
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--ok);
+    box-shadow: 0 0 8px var(--ok);
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    padding: 24px;
+    max-width: 900px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+  }
+  .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
+  .value { font-size: 28px; margin-top: 8px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  footer { color: var(--muted); font-size: 12px; padding: 0 24px 24px; }
+  .stale { color: #d29922; }
+
+  .progress-wrap { padding: 24px 24px 0; max-width: 900px; }
+  .progress-head {
+    display: flex; justify-content: space-between;
+    font-size: 12px; color: var(--muted); margin-bottom: 8px;
+  }
+  .progress-pct { color: var(--text); font-weight: 600; }
+  .bar {
+    height: 10px; background: var(--border); border-radius: 6px; overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--accent), var(--ok));
+    transition: width .4s ease;
+  }
+  .bar.indeterminate .bar-fill {
+    width: 35% !important;
+    background: var(--accent);
+    animation: slide 1.2s ease-in-out infinite;
+  }
+  @keyframes slide { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
+  .current-file {
+    padding: 12px 24px 0; max-width: 900px;
+    color: var(--muted); font-size: 13px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .current-file b { color: var(--text); font-weight: 600; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="dot" id="dot"></span>
+    <h1>quicsync · live monitor</h1>
+    <span class="mode" id="mode">--</span>
+  </header>
+
+  <div class="progress-wrap">
+    <div class="progress-head">
+      <span>Progress (files)</span>
+      <span class="progress-pct" id="pct">--</span>
+    </div>
+    <div class="bar indeterminate" id="bar"><div class="bar-fill" id="bar_fill"></div></div>
+  </div>
+
+  <div class="current-file" id="current_file">현재 파일: --</div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="label">Throughput</div>
+      <div class="value" id="throughput">--</div>
+      <div class="sub" id="throughput_bps"></div>
+    </div>
+    <div class="card">
+      <div class="label">Transferred</div>
+      <div class="value" id="transferred">--</div>
+      <div class="sub" id="total"></div>
+    </div>
+    <div class="card">
+      <div class="label">Files</div>
+      <div class="value" id="files">--</div>
+      <div class="sub" id="files_sub"></div>
+    </div>
+    <div class="card">
+      <div class="label">Elapsed</div>
+      <div class="value" id="elapsed">--</div>
+    </div>
+  </div>
+
+  <footer id="status">connecting…</footer>
+
+<script>
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+
+  function fmtDuration(secs) {
+    secs = Math.floor(secs);
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    if (h > 0) return `${h}h ${m}m ${s}s`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
+
+  async function poll() {
+    try {
+      const res = await fetch('/api/metrics', { cache: 'no-store' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const d = await res.json();
+
+      document.getElementById('mode').textContent = d.transport_mode || '--';
+      document.getElementById('throughput').textContent = d.throughput_human || '--';
+      document.getElementById('throughput_bps').textContent =
+        Math.round(d.throughput_bps || 0).toLocaleString() + ' B/s';
+      document.getElementById('transferred').textContent = d.transferred_human || '--';
+      document.getElementById('total').textContent =
+        d.total_bytes > 0 ? 'of ' + d.total_bytes.toLocaleString() + ' B' : 'total unknown';
+      document.getElementById('elapsed').textContent = fmtDuration(d.duration_secs || 0);
+
+      // 파일 수 / 현재 파일
+      const completed = d.completed_files || 0;
+      const totalFiles = d.total_files || 0;
+      document.getElementById('files').textContent = completed.toLocaleString();
+      document.getElementById('files_sub').textContent =
+        totalFiles > 0 ? 'of ' + totalFiles.toLocaleString() + ' files' : 'total unknown (pull)';
+      document.getElementById('current_file').innerHTML =
+        '현재 파일: <b>' + (d.current_file ? escapeHtml(d.current_file) : '--') + '</b>';
+
+      // 진행률 바: 전체 파일 수를 알 때만 퍼센트, 모르면 indeterminate.
+      const bar = document.getElementById('bar');
+      if (d.file_progress_pct !== null && d.file_progress_pct !== undefined) {
+        const pct = d.file_progress_pct;
+        bar.classList.remove('indeterminate');
+        document.getElementById('bar_fill').style.width = pct.toFixed(1) + '%';
+        document.getElementById('pct').textContent = pct.toFixed(1) + '%';
+      } else {
+        bar.classList.add('indeterminate');
+        document.getElementById('pct').textContent = completed.toLocaleString() + ' files';
+      }
+
+      const dot = document.getElementById('dot');
+      dot.style.background = 'var(--ok)';
+      document.getElementById('status').textContent =
+        'updated ' + new Date().toLocaleTimeString();
+      document.getElementById('status').classList.remove('stale');
+    } catch (e) {
+      // 전송이 끝나면 서버가 내려가 fetch가 실패한다 → 종료 상태로 표시.
+      document.getElementById('dot').style.background = 'var(--muted)';
+      const s = document.getElementById('status');
+      s.textContent = 'transfer ended or server unreachable (' + e.message + ')';
+      s.classList.add('stale');
+    }
+  }
+
+  poll();
+  setInterval(poll, 500);
+</script>
+</body>
+</html>

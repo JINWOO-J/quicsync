@@ -12,6 +12,51 @@ pub struct RsyncChild {
     pub(crate) process: Child,
 }
 
+/// rsync `--log-file` 한 줄에서 추출한 전송 항목.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RsyncLogItem {
+    /// 일반 파일이면 true (디렉토리/심볼릭 등은 false)
+    pub is_file: bool,
+    /// 상대 경로 파일명
+    pub name: String,
+}
+
+/// itemize 토큰인지 판별한다 (11자: update-type 1 + file-type 1 + 속성 9).
+fn is_itemize_token(t: &str) -> bool {
+    if t.len() != 11 {
+        return false;
+    }
+    let b = t.as_bytes();
+    matches!(b[0], b'<' | b'>' | b'c' | b'h' | b'.' | b'*')
+        && matches!(b[1], b'f' | b'd' | b'L' | b'D' | b'S')
+}
+
+/// rsync `--log-file`(`--log-file-format='%i %n'`) 한 줄을 파싱한다.
+///
+/// 줄 형식: `YYYY/MM/DD HH:MM:SS [pid] <itemize 11자> <파일명>`
+/// itemize(`%i`)는 11자 고정폭이며 속성 위치에 공백이 올 수 있으므로,
+/// `[pid] ` 접두 뒤 정확히 11자를 잘라낸다(공백 split에 의존하지 않음).
+/// 전송 항목이 아니면(시작/요약 메시지 등) None.
+pub fn parse_log_file_line(line: &str) -> Option<RsyncLogItem> {
+    // "...[pid] " 접두를 건너뛴다.
+    let after_pid = line.split_once("] ")?.1;
+    if after_pid.len() < 12 {
+        return None;
+    }
+    let (itemize, rest) = after_pid.split_at(11);
+    if !is_itemize_token(itemize) {
+        return None;
+    }
+    let name = rest.strip_prefix(' ')?.trim_end();
+    if name.is_empty() {
+        return None;
+    }
+    Some(RsyncLogItem {
+        is_file: itemize.as_bytes()[1] == b'f',
+        name: name.to_string(),
+    })
+}
+
 /// rsync에 전달할 원격 경로 문자열 생성 (`[user@]host:path`)
 fn format_remote_spec(remote: &RemoteSpec) -> String {
     match &remote.user {
@@ -119,8 +164,17 @@ impl RsyncChild {
         remote: &RemoteSpec,
         proxy_port: u16,
         direction: TransferDirection,
+        log_path: Option<&std::path::Path>,
     ) -> Result<Self, RsyncError> {
-        let args = build_rsync_args(rsync_options, local_paths, remote, proxy_port, direction);
+        let mut args = build_rsync_args(rsync_options, local_paths, remote, proxy_port, direction);
+
+        // --web 모니터링용 파일 이벤트 로그. stdout(사용자 출력)은 건드리지 않고
+        // 별도 로그 파일에 파일 단위 항목을 기록하게 한다.
+        if let Some(p) = log_path {
+            args.push(format!("--log-file={}", p.display()));
+            args.push("--log-file-format=%i %n".to_string());
+        }
+
         tracing::debug!("rsync spawn: rsync {}", args.join(" "));
 
         let process = Command::new("rsync")
@@ -193,6 +247,48 @@ impl RsyncChild {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // --- parse_log_file_line 단위 테스트 ---
+
+    #[test]
+    fn parse_log_line_transferred_file() {
+        let line = "2026/05/22 12:34:56 [12345] >f+++++++++ dir/file.txt";
+        let item = parse_log_file_line(line).expect("should parse");
+        assert!(item.is_file);
+        assert_eq!(item.name, "dir/file.txt");
+    }
+
+    #[test]
+    fn parse_log_line_directory_is_not_file() {
+        let line = "2026/05/22 12:34:56 [12345] cd+++++++++ subdir/";
+        let item = parse_log_file_line(line).expect("should parse");
+        assert!(!item.is_file);
+        assert_eq!(item.name, "subdir/");
+    }
+
+    #[test]
+    fn parse_log_line_preserves_spaces_in_name() {
+        let line = "2026/05/22 12:34:56 [99] >f+++++++++ my file with spaces.bin";
+        let item = parse_log_file_line(line).expect("should parse");
+        assert!(item.is_file);
+        assert_eq!(item.name, "my file with spaces.bin");
+    }
+
+    #[test]
+    fn parse_log_line_unchanged_file_still_counts() {
+        // 변경 없는 파일(.f.........)도 처리 대상이므로 파일로 센다. (itemize는 11자 고정폭)
+        let line = "2026/05/22 12:34:56 [1] .f......... unchanged.txt";
+        let item = parse_log_file_line(line).expect("should parse");
+        assert!(item.is_file);
+        assert_eq!(item.name, "unchanged.txt");
+    }
+
+    #[test]
+    fn parse_log_line_non_transfer_message_is_none() {
+        assert!(parse_log_file_line("2026/05/22 12:34:56 [1] building file list").is_none());
+        assert!(parse_log_file_line("2026/05/22 12:34:56 [1] sent 1000 bytes").is_none());
+        assert!(parse_log_file_line("").is_none());
+    }
 
     // Feature: quicsync-tunnel-mvp, Property 9: rsync 명령어 구성 정확성
     // **Validates: Requirements 7.1, 7.2**

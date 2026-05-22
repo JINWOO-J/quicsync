@@ -1,6 +1,8 @@
 // Ring Buffer 기반 무상태 버퍼링 및 backpressure 제어
 
 use std::env;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -8,6 +10,7 @@ use quinn::{RecvStream, SendStream};
 use tokio::sync::mpsc;
 
 use crate::error::{BufferError, BufferFull};
+use crate::metrics::TransferMetrics;
 
 /// 기본 버퍼 크기: 256MB
 const DEFAULT_BUFFER_SIZE: usize = 256 * 1024 * 1024;
@@ -120,6 +123,7 @@ impl BufferLayer {
         &self,
         mut tcp_rx: mpsc::Receiver<Bytes>,
         mut quic_tx: SendStream,
+        metrics: Arc<TransferMetrics>,
     ) -> Result<(), BufferError> {
         let keepalive_interval = Duration::from_secs(30);
         let mut total_bytes = 0u64;
@@ -130,6 +134,9 @@ impl BufferLayer {
                     match maybe_data {
                         Some(data) => {
                             total_bytes += data.len() as u64;
+                            metrics
+                                .bytes_transferred
+                                .fetch_add(data.len() as u64, Ordering::Relaxed);
                             quic_tx.write_all(&data).await.map_err(|e| {
                                 BufferError::InvalidSize(format!("quic write: {e}"))
                             })?;
@@ -163,6 +170,7 @@ impl BufferLayer {
         &self,
         mut quic_rx: RecvStream,
         tcp_tx: mpsc::Sender<Bytes>,
+        metrics: Arc<TransferMetrics>,
     ) -> Result<(), BufferError> {
         let mut buf = vec![0u8; 256 * 1024]; // 256KB 읽기 버퍼
         let mut total_bytes = 0u64;
@@ -186,6 +194,9 @@ impl BufferLayer {
 
             chunk_count += 1;
             total_bytes += n as u64;
+            metrics
+                .bytes_transferred
+                .fetch_add(n as u64, Ordering::Relaxed);
 
             tcp_tx.send(Bytes::copy_from_slice(&buf[..n])).await
                 .map_err(|_| {

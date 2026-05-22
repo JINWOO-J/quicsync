@@ -167,15 +167,15 @@ fn classify_install(path: &Path) -> InstallSource {
 }
 
 fn is_cargo_install_path(path: &Path) -> bool {
-    if let Some(home) = std::env::var_os("CARGO_HOME") {
-        if path.starts_with(Path::new(&home).join("bin")) {
-            return true;
-        }
+    if let Some(home) = std::env::var_os("CARGO_HOME")
+        && path.starts_with(Path::new(&home).join("bin"))
+    {
+        return true;
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        if path.starts_with(Path::new(&home).join(".cargo").join("bin")) {
-            return true;
-        }
+    if let Some(home) = std::env::var_os("HOME")
+        && path.starts_with(Path::new(&home).join(".cargo").join("bin"))
+    {
+        return true;
     }
     false
 }
@@ -252,10 +252,10 @@ fn expected_checksum(path: &Path, asset: &str) -> Result<String, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("read checksums.txt: {e}"))?;
     for line in text.lines() {
         let mut fields = line.split_whitespace();
-        if let (Some(sum), Some(name)) = (fields.next(), fields.next()) {
-            if name == asset {
-                return Ok(sum.to_ascii_lowercase());
-            }
+        if let (Some(sum), Some(name)) = (fields.next(), fields.next())
+            && name == asset
+        {
+            return Ok(sum.to_ascii_lowercase());
         }
     }
     Err(format!("checksums.txt has no entry for {asset}"))

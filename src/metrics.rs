@@ -32,6 +32,20 @@ pub struct TransferMetrics {
 
     // 전송 모드: 0=QUIC, 1=TCP
     pub transport_mode: AtomicU64,
+
+    // 파일 진행 (--web 모니터링용)
+    /// 지금까지 전송 로그에 기록된 파일 수
+    pub completed_files: AtomicU64,
+    /// 전체 전송 대상 파일 수 (Push만 사전 walk로 산정, 0=미상)
+    pub total_files: AtomicU64,
+    /// 현재 전송 중인 파일명 (파일 경계에서만 갱신되므로 Mutex 사용)
+    pub current_file: std::sync::Mutex<String>,
+}
+
+impl Default for TransferMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TransferMetrics {
@@ -52,6 +66,9 @@ impl TransferMetrics {
             integrity_chunks_verified: AtomicU64::new(0),
             integrity_bytes_verified: AtomicU64::new(0),
             transport_mode: AtomicU64::new(0),
+            completed_files: AtomicU64::new(0),
+            total_files: AtomicU64::new(0),
+            current_file: std::sync::Mutex::new(String::new()),
         }
     }
 
