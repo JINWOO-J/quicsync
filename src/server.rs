@@ -139,7 +139,9 @@ impl RemoteServer {
             .await
             .map_err(|e| ServerError::RelayError(format!("read args: {e}")))?;
 
-        let rsync_args: Vec<&str> = args_line.split_whitespace().collect();
+        // 클라이언트(--connect)는 rsync args를 JSON 배열로 전송한다(공백/quote 보존).
+        // 서버도 동일하게 JSON으로 파싱해야 인자가 올바로 복원된다.
+        let rsync_args = parse_rsync_args(&args_line)?;
 
         // 5. rsync 서버 프로세스 spawn (stdin/stdout 파이프)
         let mut child = Command::new("rsync")
@@ -211,10 +213,47 @@ impl RemoteServer {
     }
 }
 
+/// 클라이언트(--connect)가 보낸 JSON 배열 형식의 rsync 서버 인자를 파싱한다.
+/// `main.rs`의 run_connect가 `serde_json::to_string`으로 인코딩한 것과 짝을 이룬다.
+fn parse_rsync_args(line: &str) -> Result<Vec<String>, ServerError> {
+    serde_json::from_str(line.trim())
+        .map_err(|e| ServerError::RelayError(format!("parse rsync args: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ssh::parse_handshake;
+
+    #[test]
+    fn parse_rsync_args_json_roundtrip() {
+        // main.rs run_connect가 보내는 형식
+        let line = r#"["--server","-vve.LsfxCIvu","--stats",".","/tmp/qs-base/"]"#;
+        let args = parse_rsync_args(line).unwrap();
+        assert_eq!(
+            args,
+            vec!["--server", "-vve.LsfxCIvu", "--stats", ".", "/tmp/qs-base/"]
+        );
+    }
+
+    #[test]
+    fn parse_rsync_args_preserves_spaces() {
+        let line = r#"["--server",".","/remote/path with spaces"]"#;
+        let args = parse_rsync_args(line).unwrap();
+        assert_eq!(args[2], "/remote/path with spaces");
+    }
+
+    #[test]
+    fn parse_rsync_args_trailing_newline() {
+        let line = "[\"--server\",\".\",\"/dst\"]\n";
+        let args = parse_rsync_args(line).unwrap();
+        assert_eq!(args, vec!["--server", ".", "/dst"]);
+    }
+
+    #[test]
+    fn parse_rsync_args_invalid_json_errors() {
+        assert!(parse_rsync_args("--server . /dst").is_err());
+    }
 
     /// 테스트용 더미 endpoint 생성 (tokio runtime 필요)
     fn test_endpoint() -> quinn::Endpoint {

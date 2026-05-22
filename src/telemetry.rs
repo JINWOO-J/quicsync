@@ -109,8 +109,14 @@ impl SessionSpan {
 }
 
 impl ChildSpan {
-    /// span에 진입한다 (RAII guard 반환).
+    /// span에 진입한다 (RAII guard 반환). 동기 구간 전용.
     pub fn enter(&self) -> tracing::span::Entered<'_> {
         self.span.enter()
+    }
+
+    /// async future를 `.instrument()`로 감쌀 때 쓸 span 복제본을 반환한다.
+    /// (span guard를 await 경계 너머로 들고 가지 않기 위함)
+    pub fn span(&self) -> tracing::Span {
+        self.span.clone()
     }
 }

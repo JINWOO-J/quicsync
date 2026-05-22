@@ -34,6 +34,9 @@ pub struct Session {
     web_log_path: Option<std::path::PathBuf>,
     #[cfg(feature = "otel")]
     telemetry: Option<crate::telemetry::TelemetryExporter>,
+    /// 세션 루트 span. 전송 단계 span들의 부모이며, 종료 시 transfer span을 기록한다.
+    #[cfg(feature = "otel")]
+    session_span: Option<crate::telemetry::SessionSpan>,
 }
 
 impl Session {
@@ -67,10 +70,7 @@ impl Session {
         };
 
         #[cfg(feature = "otel")]
-        let _session_span_guard = telemetry.as_ref().map(|t| {
-            let span = t.start_session_span(&args);
-            span
-        });
+        let session_span = telemetry.as_ref().map(|t| t.start_session_span(&args));
 
         let remote_display = match &args.remote.user {
             Some(u) => format!("{}@{}:{}", u, args.remote.host, args.remote.path),
@@ -93,7 +93,18 @@ impl Session {
 
         // 1. SSH로 원격 서버 실행
         tracing::info!("launching remote server via SSH...");
-        let handshake = match launch_remote_server(&args.remote).await {
+        let ssh_fut = launch_remote_server(&args.remote);
+        #[cfg(feature = "otel")]
+        let ssh_result = match &session_span {
+            Some(s) => {
+                use tracing::Instrument;
+                ssh_fut.instrument(s.ssh_span().span()).await
+            }
+            None => ssh_fut.await,
+        };
+        #[cfg(not(feature = "otel"))]
+        let ssh_result = ssh_fut.await;
+        let handshake = match ssh_result {
             Ok(handshake) => handshake,
             Err(SshError::BinaryNotFound(e)) if args.install_remote => {
                 eprintln!("quicsync: remote quicsync not found; installing matching binary...");
@@ -129,15 +140,24 @@ impl Session {
             ),
             None => None,
         };
-        let tunnel = QuicTunnel::connect(QuicClientCfg {
+        let quic_fut = QuicTunnel::connect(QuicClientCfg {
             remote_addr,
             auth_token: handshake.auth_token.clone(),
             server_name: "localhost".to_string(),
             window_bytes: args.quic_window,
             fingerprint,
-        })
-        .await
-        .map_err(|e| SessionError::InitFailed(format!("QUIC: {e}")))?;
+        });
+        #[cfg(feature = "otel")]
+        let quic_result = match &session_span {
+            Some(s) => {
+                use tracing::Instrument;
+                quic_fut.instrument(s.quic_span().span()).await
+            }
+            None => quic_fut.await,
+        };
+        #[cfg(not(feature = "otel"))]
+        let quic_result = quic_fut.await;
+        let tunnel = quic_result.map_err(|e| SessionError::InitFailed(format!("QUIC: {e}")))?;
 
         // 3. 양방향 스트림 열기
         let (mut send_stream, recv_stream) = tunnel
@@ -280,6 +300,8 @@ impl Session {
             web_log_path,
             #[cfg(feature = "otel")]
             telemetry,
+            #[cfg(feature = "otel")]
+            session_span,
         })
     }
 
@@ -303,6 +325,8 @@ impl Session {
             web_log_path,
             #[cfg(feature = "otel")]
             telemetry,
+            #[cfg(feature = "otel")]
+            session_span,
         } = self;
 
         tokio::select! {
@@ -344,10 +368,18 @@ impl Session {
                 //   }
                 let _ = streams; // used when multi-stream transfer is activated
 
-                // OpenTelemetry 종료
+                // OpenTelemetry: 전송 완료 span에 최종 메트릭을 기록한 뒤 종료
                 #[cfg(feature = "otel")]
-                if let Some(telem) = telemetry {
-                    telem.shutdown();
+                {
+                    if let Some(s) = &session_span {
+                        let transfer = s.transfer_span(&metrics);
+                        let _enter = transfer.enter();
+                        tracing::info!("transfer complete");
+                    }
+                    drop(session_span);
+                    if let Some(telem) = telemetry {
+                        telem.shutdown();
+                    }
                 }
 
                 if code == 0 {
@@ -363,8 +395,11 @@ impl Session {
                 cleanup_web(&web_tasks, &web_log_path);
 
                 #[cfg(feature = "otel")]
-                if let Some(telem) = telemetry {
-                    telem.shutdown();
+                {
+                    drop(session_span);
+                    if let Some(telem) = telemetry {
+                        telem.shutdown();
+                    }
                 }
 
                 Ok(130) // SIGINT → 128+2=130
