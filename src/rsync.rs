@@ -57,6 +57,44 @@ pub fn parse_log_file_line(line: &str) -> Option<RsyncLogItem> {
     })
 }
 
+/// `QUICSYNC_DEFAULT_ARGS` 환경변수에서 기본 rsync 옵션을 읽는다.
+/// 공백으로 분리하며, 미설정/공백이면 빈 벡터를 반환한다.
+/// 코어는 rsync passthrough를 유지하되, 사용자가 매번 `-a` 등을 타이핑하지 않도록
+/// 기본 옵션을 환경변수로만 선택 주입하는 용도다(설계 모델 C).
+pub fn default_rsync_args_from_env() -> Vec<String> {
+    std::env::var("QUICSYNC_DEFAULT_ARGS")
+        .ok()
+        .map(|s| s.split_whitespace().map(String::from).collect())
+        .unwrap_or_default()
+}
+
+/// 디렉토리 전송 플래그가 옵션에 있는지 판별한다.
+/// `-a`/`-r`/`-d`(단축 묶음 내부의 a/r/d 포함)와
+/// `--archive`/`--recursive`/`--dirs`/`--files-from`을 인식한다.
+/// 하나도 없으면 rsync가 디렉토리를 "skipping directory"로 건너뛴다.
+pub fn has_recursive_flag(opts: &[String]) -> bool {
+    opts.iter().any(|o| {
+        if matches!(o.as_str(), "--archive" | "--recursive" | "--dirs")
+            || o.starts_with("--files-from")
+        {
+            return true;
+        }
+        if o.starts_with("--") {
+            return false;
+        }
+        // 단축 플래그 묶음(`-av`, `-rlt` 등): `=` 앞부분에서 a/r/d 탐색
+        match o.strip_prefix('-') {
+            Some(short) => short
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .chars()
+                .any(|c| c == 'a' || c == 'r' || c == 'd'),
+            None => false,
+        }
+    })
+}
+
 /// rsync에 전달할 원격 경로 문자열 생성 (`[user@]host:path`)
 fn format_remote_spec(remote: &RemoteSpec) -> String {
     match &remote.user {
@@ -247,6 +285,30 @@ impl RsyncChild {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // --- has_recursive_flag 단위 테스트 ---
+
+    #[test]
+    fn has_recursive_flag_present() {
+        for o in [
+            "-a", "-avz", "-r", "-rlt", "-d", "--archive", "--recursive", "--dirs",
+            "--files-from=list.txt",
+        ] {
+            assert!(has_recursive_flag(&[o.to_string()]), "expected true for {o}");
+        }
+        // 다른 옵션 사이에 섞여 있어도 인식한다
+        assert!(has_recursive_flag(&["-v".into(), "--delete".into(), "-a".into()]));
+    }
+
+    #[test]
+    fn has_recursive_flag_absent() {
+        assert!(!has_recursive_flag(&[]));
+        for o in [
+            "-v", "-vvv", "-z", "-P", "--delete", "--stats", "--progress", "--exclude=*.tmp",
+        ] {
+            assert!(!has_recursive_flag(&[o.to_string()]), "expected false for {o}");
+        }
+    }
 
     // --- parse_log_file_line 단위 테스트 ---
 

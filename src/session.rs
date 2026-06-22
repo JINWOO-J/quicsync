@@ -91,6 +91,14 @@ impl Session {
             }
         );
 
+        // 재귀 옵션이 없으면 rsync가 디렉토리를 건너뛰어(skipping directory) 0개가 전송된다.
+        // 막지는 않되(최상위 파일만 전송하려는 경우도 있으므로) 사용자에게 명확히 알린다.
+        if !crate::rsync::has_recursive_flag(&args.rsync_options) {
+            eprintln!(
+                "quicsync: 경고 — 재귀 옵션(-a, -r 등)이 없어 디렉토리는 복사되지 않습니다(rsync가 건너뜀).\n          디렉토리를 동기화하려면 -a 를 추가하거나 QUICSYNC_DEFAULT_ARGS=-a 를 설정하세요."
+            );
+        }
+
         // 1. SSH로 원격 서버 실행
         tracing::info!("launching remote server via SSH...");
         let ssh_fut = launch_remote_server(&args.remote);

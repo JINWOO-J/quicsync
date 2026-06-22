@@ -208,6 +208,7 @@ brew install gnu-time
 |----------|---------|-------------|
 | `QUICSYNC_BUFFER_SIZE` | `268435456` (256MB) | Internal buffer-layer allocation (bytes). The relay leans on bounded-channel backpressure, so reach for `--window` first when tuning. |
 | `QUICSYNC_WINDOW` | `64` | QUIC window size (MB). Raise it on high-RTT links for more throughput. |
+| `QUICSYNC_DEFAULT_ARGS` | unset | Default rsync options prepended to every transfer (e.g. `-a`); user-supplied options come after and take precedence. quicsync warns when no recursive flag (`-a`/`-r`/`-d`) is present, since rsync silently skips directories otherwise. |
 | `RUST_LOG` | unset | Log filter, e.g. `RUST_LOG=debug`, `RUST_LOG=quicsync=trace`. |
 
 ```bash
@@ -219,6 +220,9 @@ QUICSYNC_WINDOW=128 quicsync /src user@host:/dst
 
 # 512 MB buffer
 QUICSYNC_BUFFER_SIZE=536870912 quicsync /src user@host:/dst
+
+# Always pass -a (archive) so directories sync without retyping it
+QUICSYNC_DEFAULT_ARGS=-a quicsync host:~/data ./data
 
 # Debug logs
 RUST_LOG=debug quicsync /src user@host:/dst

@@ -232,15 +232,20 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
 
     // trailing args를 rsync 옵션과 경로(positional)로 분리한다.
     // `-`로 시작하는 인수는 rsync 옵션, 나머지는 경로로 취급한다.
-    let mut rsync_options = Vec::new();
+    let mut user_rsync_options = Vec::new();
     let mut positionals = Vec::new();
     for arg in &remaining {
         if arg.starts_with('-') {
-            rsync_options.push(arg.to_string());
+            user_rsync_options.push(arg.to_string());
         } else {
             positionals.push(*arg);
         }
     }
+
+    // QUICSYNC_DEFAULT_ARGS의 기본 옵션을 사용자 옵션 앞에 주입한다.
+    // 사용자가 명시한 옵션이 뒤에 와서 필요 시 override할 수 있다(예: 기본 -a + 사용자 --no-owner).
+    let mut rsync_options = crate::rsync::default_rsync_args_from_env();
+    rsync_options.extend(user_rsync_options);
 
     if positionals.len() < 2 {
         return Err(CliError::InvalidArgs(
