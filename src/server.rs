@@ -143,6 +143,11 @@ impl RemoteServer {
         // 서버도 동일하게 JSON으로 파싱해야 인자가 올바로 복원된다.
         let rsync_args = parse_rsync_args(&args_line)?;
 
+        // 표준 SSH+rsync에서는 원격 셸이 경로의 `~`를 확장하지만, quicsync는
+        // rsync를 셸 없이 직접 spawn하므로 서버가 대신 확장한다. 확장하지 않으면
+        // rsync sender가 리터럴 `~/...`를 glob해 0개 매칭 → "received 0 names" → code 23.
+        let rsync_args: Vec<String> = rsync_args.iter().map(|a| expand_tilde(a)).collect();
+
         // 5. rsync 서버 프로세스 spawn (stdin/stdout 파이프)
         let mut child = Command::new("rsync")
             .args(&rsync_args)
@@ -220,6 +225,23 @@ fn parse_rsync_args(line: &str) -> Result<Vec<String>, ServerError> {
         .map_err(|e| ServerError::RelayError(format!("parse rsync args: {e}")))
 }
 
+/// 경로 인자의 선행 `~`/`~/`를 원격 사용자의 HOME으로 확장한다.
+/// 셸을 거치지 않는 spawn에서 `~`가 리터럴로 전달되는 것을 보정한다.
+/// 선행 `~`만 처리하며(`~user` 형태와 경로 중간의 `~`는 건드리지 않는다),
+/// HOME 미설정 시 원본을 그대로 반환한다.
+fn expand_tilde(arg: &str) -> String {
+    if arg == "~" {
+        std::env::var("HOME").unwrap_or_else(|_| arg.to_string())
+    } else if let Some(rest) = arg.strip_prefix("~/") {
+        match std::env::var("HOME") {
+            Ok(home) => format!("{home}/{rest}"),
+            Err(_) => arg.to_string(),
+        }
+    } else {
+        arg.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +275,27 @@ mod tests {
     #[test]
     fn parse_rsync_args_invalid_json_errors() {
         assert!(parse_rsync_args("--server . /dst").is_err());
+    }
+
+    #[test]
+    fn expand_tilde_slash_uses_home() {
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        assert_eq!(expand_tilde("~/work/x-backup"), format!("{home}/work/x-backup"));
+    }
+
+    #[test]
+    fn expand_tilde_bare_is_home() {
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        assert_eq!(expand_tilde("~"), home);
+    }
+
+    #[test]
+    fn expand_tilde_noop_for_non_tilde() {
+        assert_eq!(expand_tilde("."), ".");
+        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+        assert_eq!(expand_tilde("--server"), "--server");
+        // 경로 중간의 ~ 는 확장하지 않는다
+        assert_eq!(expand_tilde("/a/~/b"), "/a/~/b");
     }
 
     /// 테스트용 더미 endpoint 생성 (tokio runtime 필요)
