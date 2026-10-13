@@ -131,6 +131,18 @@ impl Session {
             Err(e) => return Err(SessionError::InitFailed(format!("SSH: {e}"))),
         };
 
+        let local_version = env!("CARGO_PKG_VERSION");
+        if handshake.remote_version != local_version {
+            let target = match &args.remote.user {
+                Some(user) => format!("{}@{}", user, args.remote.host),
+                None => args.remote.host.clone(),
+            };
+            eprintln!(
+                "quicsync: 경고 — 원격 quicsync 버전({})이 로컬({local_version})과 달라 전송이 실패할 수 있습니다.\n          버전을 맞추려면: quicsync install-remote {target}",
+                handshake.remote_version
+            );
+        }
+
         let ssh_process = handshake.ssh_process;
         let host_port = format!("{}:{}", args.remote.host, handshake.remote_port);
         let remote_addr: SocketAddr = tokio::net::lookup_host(&host_port)

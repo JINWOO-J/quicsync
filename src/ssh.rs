@@ -10,12 +10,16 @@ use crate::error::SshError;
 use crate::types::{RemoteSpec, SshHandshake};
 
 const HANDSHAKE_PREFIX: &str = "QUICSYNC_READY";
+const VERSION_PREFIX: &str = "quicsync ";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+// 모든 원격 버전이 `--version`을 지원하므로, 서버 측 프로토콜 변경 없이 구버전 서버의 버전도 얻는다.
+// `PATH=... cmd` 형태를 명령마다 반복하는 이유: 원격 로그인 셸이 fish여도 동작하게 하기 위함.
+const REMOTE_COMMAND: &str = "PATH=$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH quicsync --version && PATH=$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH quicsync --server";
 
 /// SSH를 통해 원격 호스트에서 quicsync server를 실행하고 핸드셰이크를 수신한다.
 ///
-/// 1. `ssh [user@]host quicsync --server` 명령어를 자식 프로세스로 실행
-/// 2. stdout에서 `QUICSYNC_READY <port> <token>` 핸드셰이크 라인을 파싱
+/// 1. `ssh [user@]host quicsync --version && quicsync --server` 명령어를 자식 프로세스로 실행
+/// 2. stdout에서 `quicsync <version>` 라인과 `QUICSYNC_READY <port> <token>` 핸드셰이크 라인을 파싱
 /// 3. SSH 프로세스는 터널로 유지 (종료하지 않음)
 pub async fn launch_remote_server(remote: &RemoteSpec) -> Result<SshHandshake, SshError> {
     let ssh_target = match &remote.user {
@@ -25,7 +29,7 @@ pub async fn launch_remote_server(remote: &RemoteSpec) -> Result<SshHandshake, S
 
     let mut child = Command::new("ssh")
         .arg(&ssh_target)
-        .arg("PATH=$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH quicsync --server")
+        .arg(REMOTE_COMMAND)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -42,10 +46,17 @@ pub async fn launch_remote_server(remote: &RemoteSpec) -> Result<SshHandshake, S
         .ok_or_else(|| SshError::ConnectionFailed("failed to capture stderr".into()))?;
 
     let mut stdout_reader = BufReader::new(stdout);
+    let mut version_line = String::new();
     let mut line = String::new();
 
-    // stdout에서 핸드셰이크 라인 읽기 (타임아웃 적용)
-    let read_result = timeout(HANDSHAKE_TIMEOUT, stdout_reader.read_line(&mut line)).await;
+    // stdout에서 버전 라인과 핸드셰이크 라인 읽기 (타임아웃 적용)
+    let read_result = timeout(HANDSHAKE_TIMEOUT, async {
+        if stdout_reader.read_line(&mut version_line).await? == 0 {
+            return Ok(0);
+        }
+        stdout_reader.read_line(&mut line).await
+    })
+    .await;
 
     match read_result {
         Ok(Ok(0)) | Ok(Err(_)) => {
@@ -61,6 +72,7 @@ pub async fn launch_remote_server(remote: &RemoteSpec) -> Result<SshHandshake, S
         Ok(Ok(_)) => {} // 정상 읽기 완료
     }
 
+    let remote_version = parse_version_line(&version_line)?;
     let (port, token, fingerprint) = parse_handshake(&line)?;
 
     Ok(SshHandshake {
@@ -68,7 +80,22 @@ pub async fn launch_remote_server(remote: &RemoteSpec) -> Result<SshHandshake, S
         auth_token: token,
         ssh_process: child,
         fingerprint,
+        remote_version,
     })
+}
+
+/// 원격 `quicsync --version` 출력(`quicsync <version>`)에서 버전 문자열을 꺼낸다.
+pub fn parse_version_line(line: &str) -> Result<String, SshError> {
+    line.trim()
+        .strip_prefix(VERSION_PREFIX)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            SshError::HandshakeParseFailed(format!(
+                "expected '{VERSION_PREFIX}<version>', got '{}'",
+                line.trim()
+            ))
+        })
 }
 
 /// stderr 내용을 읽어 SSH 오류를 분류한다.
@@ -164,6 +191,17 @@ mod tests {
     use super::*;
     use crate::types::AuthToken;
     use proptest::prelude::*;
+
+    #[test]
+    fn parse_version_line_extracts_version() {
+        assert_eq!(parse_version_line("quicsync 0.1.4\n").unwrap(), "0.1.4");
+    }
+
+    #[test]
+    fn parse_version_line_rejects_handshake_line() {
+        let result = parse_version_line("QUICSYNC_READY 8080 aabbccdd");
+        assert!(matches!(result, Err(SshError::HandshakeParseFailed(_))));
+    }
 
     #[test]
     fn parse_valid_handshake() {

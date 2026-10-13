@@ -131,6 +131,7 @@ pub struct SshHandshake {
     pub auth_token: String,
     pub ssh_process: Child,
     pub fingerprint: Option<String>,
+    pub remote_version: String,
 }
 
 /// 통계 출력 형식
