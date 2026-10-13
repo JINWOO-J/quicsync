@@ -31,6 +31,15 @@ pub enum FallbackMode {
     Rsync,
 }
 
+/// 전송 경로 선택
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// RTT가 낮으면 rsync over SSH로 전환한다
+    Auto,
+    /// 항상 QUIC으로 전송한다
+    Quic,
+}
+
 /// CLI 인수 파싱 결과
 #[derive(Debug, Clone)]
 pub struct CliArgs {
@@ -56,6 +65,8 @@ pub struct CliArgs {
     pub no_integrity: bool,
     /// QUIC 초기화 실패 시 fallback 동작
     pub fallback: FallbackMode,
+    /// --transport auto|quic (기본: auto)
+    pub transport: Transport,
     /// 원격 quicsync가 없을 때 현재 로컬 바이너리를 원격에 설치하고 한 번 재시도
     pub install_remote: bool,
     /// --web: 전송 중 127.0.0.1에 실시간 모니터링 웹 서버를 띄운다

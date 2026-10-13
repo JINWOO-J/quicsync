@@ -8,7 +8,7 @@ use std::io::IsTerminal;
 
 use crate::error::CliError;
 use crate::quic::window_bytes_from_env;
-use crate::types::{CliArgs, FallbackMode, RemoteSpec, StatsFormat, TransferDirection};
+use crate::types::{CliArgs, FallbackMode, RemoteSpec, StatsFormat, TransferDirection, Transport};
 
 /// 경로가 원격 경로인지 판별한다.
 /// rsync 관례: `/` 또는 `.`로 시작하지 않고 `:`를 포함하면 원격으로 간주한다.
@@ -81,6 +81,7 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
              quicsync -avz --delete /src user@host:/dst     # With rsync options\n  \
              quicsync ./* user@host:/dst                    # Multiple sources\n  \
              quicsync --window 128 /src user@host:/dst      # 128MB QUIC window\n  \
+             quicsync --transport=quic /src user@host:/dst  # Never switch to rsync over SSH\n  \
              quicsync --install-remote /src user@host:/dst  # Install remote binary if missing\n  \
              quicsync install-remote user@host              # Install current binary remotely\n  \
              quicsync update --check                        # Check for release update\n  \
@@ -123,6 +124,7 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
     let mut otel_endpoint: Option<String> = None;
     let mut no_integrity = false;
     let mut fallback = FallbackMode::None;
+    let mut transport = Transport::Auto;
     let mut install_remote = false;
     let mut web = false;
     let mut remaining: Vec<&str> = Vec::new();
@@ -174,6 +176,12 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
                 })?;
                 fallback = parse_fallback_mode(val)?;
             }
+            "--transport" => {
+                let val = iter.next().ok_or_else(|| {
+                    CliError::InvalidArgs("--transport requires 'auto' or 'quic'".to_string())
+                })?;
+                transport = parse_transport(val)?;
+            }
             "--install-remote" => install_remote = true,
             "--web" => web = true,
             _ if arg.starts_with("--window=") => {
@@ -181,6 +189,9 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
             }
             _ if arg.starts_with("--fallback=") => {
                 fallback = parse_fallback_mode(arg.strip_prefix("--fallback=").unwrap())?;
+            }
+            _ if arg.starts_with("--transport=") => {
+                transport = parse_transport(arg.strip_prefix("--transport=").unwrap())?;
             }
             _ if arg.starts_with("--streams=") => {
                 let val = arg.strip_prefix("--streams=").unwrap();
@@ -291,6 +302,7 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
             otel_endpoint,
             no_integrity,
             fallback,
+            transport,
             install_remote,
             web,
         })
@@ -320,6 +332,7 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
             otel_endpoint,
             no_integrity,
             fallback,
+            transport,
             install_remote,
             web,
         })
@@ -332,6 +345,16 @@ fn parse_fallback_mode(val: &str) -> Result<FallbackMode, CliError> {
         "rsync" => Ok(FallbackMode::Rsync),
         _ => Err(CliError::InvalidArgs(format!(
             "invalid --fallback value '{val}' (expected 'none' or 'rsync')"
+        ))),
+    }
+}
+
+fn parse_transport(val: &str) -> Result<Transport, CliError> {
+    match val {
+        "auto" => Ok(Transport::Auto),
+        "quic" => Ok(Transport::Quic),
+        _ => Err(CliError::InvalidArgs(format!(
+            "invalid --transport value '{val}' (expected 'auto' or 'quic')"
         ))),
     }
 }
@@ -487,6 +510,7 @@ mod tests {
         assert_eq!(cli.otel_endpoint, None);
         assert!(!cli.no_integrity);
         assert_eq!(cli.fallback, FallbackMode::None);
+        assert_eq!(cli.transport, Transport::Auto);
         assert!(!cli.install_remote);
         assert!(!cli.web);
     }
@@ -647,6 +671,26 @@ mod tests {
     #[test]
     fn parse_args_fallback_invalid_rejected() {
         let a = args(&["quicsync", "--fallback", "auto", "/src", "host:/dst"]);
+        assert!(matches!(parse_args(&a), Err(CliError::InvalidArgs(_))));
+    }
+
+    #[test]
+    fn parse_args_transport_quic() {
+        let a = args(&["quicsync", "--transport", "quic", "/src", "host:/dst"]);
+        let cli = parse_args(&a).unwrap();
+        assert_eq!(cli.transport, Transport::Quic);
+    }
+
+    #[test]
+    fn parse_args_transport_equals_quic() {
+        let a = args(&["quicsync", "--transport=quic", "/src", "host:/dst"]);
+        let cli = parse_args(&a).unwrap();
+        assert_eq!(cli.transport, Transport::Quic);
+    }
+
+    #[test]
+    fn parse_args_transport_invalid_rejected() {
+        let a = args(&["quicsync", "--transport", "rsync", "/src", "host:/dst"]);
         assert!(matches!(parse_args(&a), Err(CliError::InvalidArgs(_))));
     }
 

@@ -91,7 +91,7 @@ quicsync --install-remote /src user@host:/dst
 quicsync --fallback=rsync /src user@host:/dst
 ```
 
-quicsync adds `--stats` to rsync for you, so rsync prints a summary when it finishes. Want quicsync's own numbers too? Pass `--stats`. The direction and paths show at the start, the elapsed time at the end.
+quicsync adds `--stats` to rsync for you, so rsync prints a summary when it finishes. Want quicsync's own numbers too? Pass `--stats`. With the QUIC tunnel, the direction and paths show at the start, and the elapsed time shows at the end.
 
 ### Supported path forms
 
@@ -114,9 +114,35 @@ Push mode takes multiple source paths, globs included. Pull mode takes exactly o
 | `--stats` | Print quicsync's own transfer stats | false |
 | `--stats-format text\|json` | quicsync stats output format | text |
 | `--fallback none\|rsync` | Retry over rsync-over-SSH if QUIC session init fails | none |
+| `--transport auto\|quic` | `auto` selects rsync over SSH when the RTT is below 10 ms. `quic` always uses the QUIC tunnel. | auto |
 | `--install-remote` | Install `quicsync` on the remote if missing, then retry once | false |
 
 Anything else is passed through as an rsync option or a path. Experimental options that aren't wired into the real transfer path yet are rejected outright rather than silently accepted.
+
+### Transport selection
+
+At low RTT, plain rsync over SSH can be faster than the QUIC tunnel. With the default `--transport=auto`, quicsync checks the RTT before the transfer:
+
+1. quicsync opens one TCP connection to port 22 on the remote host.
+2. If the connection completes in less than 10 ms, quicsync runs plain rsync over SSH.
+3. If not, quicsync uses the QUIC tunnel.
+
+When quicsync selects rsync over SSH, it prints this notice to stderr:
+
+```text
+quicsync: RTT가 0.4ms로 10ms보다 낮아 rsync over SSH로 전송합니다.
+          손실이 있는 회선이면 QUIC이 더 빠를 수 있습니다: --transport=quic
+```
+
+quicsync always uses the QUIC tunnel in these cases:
+
+- You pass `--transport=quic`.
+- You pass `--web` or `--stats`. These features are available only with the QUIC tunnel.
+- Port 22 does not answer in 10 ms. For example, a firewall drops the connection.
+
+The check does not detect packet loss. On a lossy link, rsync over SSH can be much slower, also at low RTT. If your link loses packets, pass `--transport=quic`. Refer to [Low-RTT networks](#low-rtt-networks) for the measurements.
+
+The check always uses port 22. It does not read the port from your SSH config. When the check selects rsync over SSH, the remote sshd log can record one closed connection from the check.
 
 ### Web monitor
 
@@ -186,7 +212,29 @@ Symmetric latency injected between Docker containers with pumba (tc netem). Sing
 | 200ms | 63.24s (2.2 MB/s) | 9.31s (13.7 MB/s) | **6.79x** |
 | 500ms | 106.14s (1.3 MB/s) | 20.51s (6.2 MB/s) | **5.18x** |
 
-On a LAN (RTT 0 ms), QUIC's userspace overhead puts it on par with rsync+ssh. The gap opens as RTT climbs: TCP is capped by `throughput ≈ window_size / RTT`, while QUIC (BBR) with a 64 MB window keeps the pipe full.
+In this test, quicsync and rsync+ssh were on par at 0 ms RTT. A different test shows rsync+ssh ahead below about 12 ms RTT. Refer to [Low-RTT networks](#low-rtt-networks). The gap opens as RTT climbs: TCP is capped by `throughput ≈ window_size / RTT`, while QUIC (BBR) with a 64 MB window keeps the pipe full.
+
+### Low-RTT networks
+
+A VM sends to a bare-metal host (pull). tc netem in the VM adds the delay and the loss. Each value is the mean of 2 runs, in seconds.
+
+| RTT | 1 GB file, rsync+ssh | 1 GB file, quicsync | 10 KB × 10,000, rsync+ssh | 10 KB × 10,000, quicsync |
+|-----|------|------|------|------|
+| 0.3ms | 3.7 | 8.3 | 1.6 | 1.8 |
+| 1.4ms | 4.1 | 7.9 | 1.5 | 1.8 |
+| 2.4ms | 4.2 | 7.9 | 1.6 | 1.8 |
+| 5.5ms | 4.3 | 8.0 | 1.6 | 1.8 |
+| 10.4ms | 6.8 | 8.1 | 1.7 | 2.0 |
+| 20.5ms | 12.6 | 8.3 | 2.2 | 2.2 |
+
+The two tools are equal at about 12 ms RTT for the 1 GB file and at about 20 ms for the small files. In this setup, one VM CPU core limits the QUIC sender to about 125 MB/s.
+
+Packet loss changes the result. These values are for a 1 GB file at 5 ms RTT, 1 run, with a 60 s limit:
+
+| Loss | rsync+ssh | quicsync |
+|------|-----------|----------|
+| 0.5% | 14.3 MB/s (stopped at 60 s) | 127.8 MB/s (8.0 s) |
+| 1% | 5.2 MB/s (stopped at 60 s) | 128.8 MB/s (8.0 s) |
 
 ### Running the benchmarks
 

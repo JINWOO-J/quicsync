@@ -12,6 +12,7 @@ use crate::types::{RemoteSpec, SshHandshake};
 const HANDSHAKE_PREFIX: &str = "QUICSYNC_READY";
 const VERSION_PREFIX: &str = "quicsync ";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const SSH_PORT: u16 = 22;
 // 모든 원격 버전이 `--version`을 지원하므로, 서버 측 프로토콜 변경 없이 구버전 서버의 버전도 얻는다.
 // `PATH=... cmd` 형태를 명령마다 반복하는 이유: 원격 로그인 셸이 fish여도 동작하게 하기 위함.
 const REMOTE_COMMAND: &str = "PATH=$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH quicsync --version && PATH=$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH quicsync --server";
@@ -82,6 +83,26 @@ pub async fn launch_remote_server(remote: &RemoteSpec) -> Result<SshHandshake, S
         fingerprint,
         remote_version,
     })
+}
+
+/// 원격 호스트의 SSH 포트로 TCP 연결을 한 번 맺어 RTT를 잰다.
+/// `limit` 안에 응답이 없거나 주소를 찾지 못하면 None을 반환한다.
+pub async fn probe_ssh_rtt(host: &str, limit: Duration) -> Option<Duration> {
+    let addr = tokio::net::lookup_host((host, SSH_PORT))
+        .await
+        .ok()?
+        .next()?;
+    probe_tcp_rtt(addr, limit).await
+}
+
+async fn probe_tcp_rtt(addr: std::net::SocketAddr, limit: Duration) -> Option<Duration> {
+    let started = std::time::Instant::now();
+    match timeout(limit, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(_)) => Some(started.elapsed()),
+        // 포트가 닫혀 있어도 RST가 돌아오기까지 왕복 한 번이 걸리므로 RTT로 쓸 수 있다.
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => Some(started.elapsed()),
+        _ => None,
+    }
 }
 
 /// 원격 `quicsync --version` 출력(`quicsync <version>`)에서 버전 문자열을 꺼낸다.
@@ -191,6 +212,21 @@ mod tests {
     use super::*;
     use crate::types::AuthToken;
     use proptest::prelude::*;
+
+    #[tokio::test]
+    async fn probe_tcp_rtt_measures_accepted_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert!(probe_tcp_rtt(addr, Duration::from_secs(1)).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn probe_tcp_rtt_measures_refused_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        assert!(probe_tcp_rtt(addr, Duration::from_secs(1)).await.is_some());
+    }
 
     #[test]
     fn parse_version_line_extracts_version() {

@@ -6,8 +6,13 @@ use quicsync::remote_install::{RemoteInstaller, parse_install_remote_args};
 use quicsync::rsync::RsyncChild;
 use quicsync::server::RemoteServer;
 use quicsync::session::Session;
-use quicsync::types::FallbackMode;
+use quicsync::ssh::probe_ssh_rtt;
+use quicsync::types::{FallbackMode, Transport};
 use quicsync::update::{Updater, parse_update_args};
+
+// 측정한 교차점(rsync+ssh와 quicsync가 같아지는 RTT)은 1GB 단일 파일 약 12ms, 10KB 파일 1만 개 약 20ms다.
+// 손실이 있는 회선에서는 낮은 RTT에서도 rsync+ssh가 크게 느려지므로 교차점보다 낮게 잡는다.
+const AUTO_RSYNC_MAX_RTT: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -322,6 +327,19 @@ async fn run_client(raw_args: &[String]) -> ExitCode {
         }
     };
 
+    // 재귀 옵션이 없으면 rsync가 디렉토리를 건너뛰어(skipping directory) 0개가 전송된다.
+    // 막지는 않되(최상위 파일만 전송하려는 경우도 있으므로) 사용자에게 명확히 알린다.
+    // 순정 rsync 경로는 정상 종료 시 rsync stderr를 보여 주지 않으므로 경로를 고르기 전에 출력한다.
+    if !quicsync::rsync::has_recursive_flag(&args.rsync_options) {
+        eprintln!(
+            "quicsync: 경고 — 재귀 옵션(-a, -r 등)이 없어 디렉토리는 복사되지 않습니다(rsync가 건너뜀).\n          디렉토리를 동기화하려면 -a 를 추가하거나 QUICSYNC_DEFAULT_ARGS=-a 를 설정하세요."
+        );
+    }
+
+    if should_switch_to_rsync(&args).await {
+        return run_rsync_fallback(args).await;
+    }
+
     let fallback = args.fallback;
     let fallback_args = args.clone();
 
@@ -346,6 +364,38 @@ async fn run_client(raw_args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// RTT가 낮으면 rsync over SSH가 더 빠르므로 전환 여부를 정하고, 전환하면 사용자에게 알린다.
+/// --web, --stats는 QUIC 경로에만 있는 기능이라 요청되면 전환하지 않는다.
+async fn should_switch_to_rsync(args: &quicsync::types::CliArgs) -> bool {
+    if args.transport != Transport::Auto {
+        return false;
+    }
+    if args.web || args.stats {
+        tracing::info!("auto transport: --web/--stats requested, staying on QUIC");
+        return false;
+    }
+    let Some(rtt) = probe_ssh_rtt(&args.remote.host, AUTO_RSYNC_MAX_RTT).await else {
+        tracing::info!(
+            "auto transport: no SSH port response within {}ms, using QUIC",
+            AUTO_RSYNC_MAX_RTT.as_millis()
+        );
+        return false;
+    };
+    if rtt >= AUTO_RSYNC_MAX_RTT {
+        tracing::info!(
+            "auto transport: RTT {:.1}ms, using QUIC",
+            rtt.as_secs_f64() * 1000.0
+        );
+        return false;
+    }
+    eprintln!(
+        "quicsync: RTT가 {:.1}ms로 {}ms보다 낮아 rsync over SSH로 전송합니다.\n          손실이 있는 회선이면 QUIC이 더 빠를 수 있습니다: --transport=quic",
+        rtt.as_secs_f64() * 1000.0,
+        AUTO_RSYNC_MAX_RTT.as_millis()
+    );
+    true
 }
 
 async fn run_rsync_fallback(args: quicsync::types::CliArgs) -> ExitCode {

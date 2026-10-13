@@ -91,7 +91,7 @@ quicsync --install-remote /src user@host:/dst
 quicsync --fallback=rsync /src user@host:/dst
 ```
 
-quicsync가 rsync에 `--stats`를 대신 붙여 주므로, 전송이 끝나면 rsync 요약이 출력된다. quicsync 자체 통계도 보고 싶으면 `--stats`를 직접 붙인다. 시작할 때 방향과 경로를, 끝날 때 경과 시간을 출력한다.
+quicsync가 rsync에 `--stats`를 대신 붙여 주므로, 전송이 끝나면 rsync 요약이 출력된다. quicsync 자체 통계도 보고 싶으면 `--stats`를 직접 붙인다. QUIC 터널로 보낼 때는 시작할 때 방향과 경로를, 끝날 때 경과 시간을 출력한다.
 
 ### 지원하는 경로 형식
 
@@ -114,9 +114,35 @@ Push 모드는 여러 소스 경로를 받는다(glob 포함). Pull 모드는 �
 | `--stats` | quicsync 자체 전송 통계 출력 | false |
 | `--stats-format text\|json` | quicsync 통계 출력 형식 | text |
 | `--fallback none\|rsync` | QUIC 세션 초기화 실패 시 rsync-over-SSH로 재시도 | none |
+| `--transport auto\|quic` | `auto`는 RTT가 10ms 미만이면 rsync over SSH로 전송, `quic`은 항상 QUIC 터널 사용 | auto |
 | `--install-remote` | 원격 `quicsync`가 없으면 설치 후 1회 재시도 | false |
 
 나머지 인수는 rsync 옵션이나 경로로 처리된다. 아직 실제 전송 경로에 연결되지 않은 실험 옵션은 성공한 척 무시하지 않고 그대로 거부한다.
+
+### 전송 경로 선택
+
+RTT가 낮으면 QUIC 터널보다 순정 rsync over SSH가 빠를 수 있다. 기본값인 `--transport=auto`에서는 전송 전에 RTT를 확인한다.
+
+1. 원격 호스트의 22번 포트로 TCP 연결을 한 번 맺는다.
+2. 10ms 안에 연결되면 순정 rsync over SSH로 전송한다.
+3. 그렇지 않으면 QUIC 터널로 전송한다.
+
+rsync over SSH로 바꿀 때는 stderr에 다음 알림을 출력한다.
+
+```text
+quicsync: RTT가 0.4ms로 10ms보다 낮아 rsync over SSH로 전송합니다.
+          손실이 있는 회선이면 QUIC이 더 빠를 수 있습니다: --transport=quic
+```
+
+다음 경우에는 항상 QUIC 터널을 쓴다.
+
+- `--transport=quic`을 준 경우
+- `--web`이나 `--stats`를 준 경우. 두 기능은 QUIC 터널에서만 동작한다.
+- 22번 포트가 10ms 안에 응답하지 않는 경우. 예를 들어 방화벽이 연결을 버리면 이렇게 된다.
+
+RTT 확인으로는 패킷 손실을 알 수 없다. 손실이 있는 회선에서는 RTT가 낮아도 rsync over SSH가 크게 느려질 수 있으므로, 그런 회선에서는 `--transport=quic`을 준다. 측정값은 [낮은 RTT 회선](#낮은-rtt-회선)에 있다.
+
+RTT 확인은 항상 22번 포트를 쓰며, SSH 설정의 포트는 읽지 않는다. rsync over SSH로 바꾼 경우 원격 sshd 로그에 RTT 확인용 연결이 종료된 기록이 한 줄 남을 수 있다.
 
 ### 웹 모니터
 
@@ -186,7 +212,29 @@ Docker 컨테이너 사이에 pumba(tc netem)로 양방향 지연을 주입해 �
 | 200ms | 63.24s (2.2 MB/s) | 9.31s (13.7 MB/s) | **6.79x** |
 | 500ms | 106.14s (1.3 MB/s) | 20.51s (6.2 MB/s) | **5.18x** |
 
-LAN(RTT 0ms)에서는 QUIC userspace 오버헤드 때문에 rsync+ssh와 비슷하다. RTT가 올라갈수록 격차가 벌어진다. TCP는 `throughput ≈ window_size / RTT`에 묶이는 반면, QUIC(BBR) + 64MB 윈도우는 회선을 가득 채운다.
+이 측정에서는 RTT 0ms일 때 두 도구가 비슷했다. 다른 환경에서 측정했을 때는 RTT가 약 12ms보다 낮으면 rsync+ssh가 빨랐다([낮은 RTT 회선](#낮은-rtt-회선) 참고). RTT가 올라갈수록 격차가 벌어진다. TCP는 `throughput ≈ window_size / RTT`에 묶이는 반면, QUIC(BBR) + 64MB 윈도우는 회선을 가득 채운다.
+
+### 낮은 RTT 회선
+
+VM이 bare-metal 호스트로 보내는(pull) 구성이다. 지연과 손실은 VM 안에서 tc netem으로 넣었다. 값은 2회 평균이며 단위는 초다.
+
+| RTT | 1GB 파일 rsync+ssh | 1GB 파일 quicsync | 10KB × 1만 개 rsync+ssh | 10KB × 1만 개 quicsync |
+|-----|------|------|------|------|
+| 0.3ms | 3.7 | 8.3 | 1.6 | 1.8 |
+| 1.4ms | 4.1 | 7.9 | 1.5 | 1.8 |
+| 2.4ms | 4.2 | 7.9 | 1.6 | 1.8 |
+| 5.5ms | 4.3 | 8.0 | 1.6 | 1.8 |
+| 10.4ms | 6.8 | 8.1 | 1.7 | 2.0 |
+| 20.5ms | 12.6 | 8.3 | 2.2 | 2.2 |
+
+두 도구의 시간이 같아지는 RTT는 1GB 파일에서 약 12ms, 작은 파일에서 약 20ms다. 이 구성에서는 VM의 CPU 코어 하나가 QUIC 송신을 약 125MB/s로 제한한다.
+
+패킷 손실이 있으면 결과가 달라진다. 아래는 RTT 5ms에서 1GB 파일을 1회 보낸 결과이며, 60초 제한을 두었다.
+
+| 손실 | rsync+ssh | quicsync |
+|------|-----------|----------|
+| 0.5% | 14.3 MB/s (60초에서 중단) | 127.8 MB/s (8.0초) |
+| 1% | 5.2 MB/s (60초에서 중단) | 128.8 MB/s (8.0초) |
 
 ### 벤치마크 실행
 
