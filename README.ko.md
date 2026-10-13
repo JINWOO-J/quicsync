@@ -144,6 +144,30 @@ RTT 확인으로는 패킷 손실을 알 수 없다. 손실이 있는 회선에�
 
 RTT 확인은 항상 22번 포트를 쓰며, SSH 설정의 포트는 읽지 않는다. rsync over SSH로 바꾼 경우 원격 sshd 로그에 RTT 확인용 연결이 종료된 기록이 한 줄 남을 수 있다.
 
+### SSH 연결 재사용
+
+quicsync는 전송할 때마다 SSH 연결을 새로 맺으며, RTT가 높으면 이 단계에 왕복이 많이 든다. quicsync는 `ssh`를 별도 옵션 없이 실행하므로 `~/.ssh/config` 설정을 그대로 따른다. 같은 호스트로 반복해서 보낸다면 ControlMaster 설정으로 SSH 연결 하나를 재사용할 수 있다.
+
+```sshconfig
+Host example.com
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    ControlPersist 10m
+```
+
+첫 전송이 공유 연결을 열고, 이후 같은 호스트로 가는 전송은 `ControlPersist` 시간이 지날 때까지 그 연결을 쓴다. `--transport=auto`가 고른 rsync over SSH도 같은 연결을 쓴다. 전송이 끝나도 백그라운드 ssh 프로세스가 남으며, 바로 닫으려면 `ssh -O exit example.com`을 실행한다.
+
+아래는 RTT 200ms에서 10KB 파일 3개를 pull로 1회씩 보낸 결과다.
+
+| | 재사용 없음 | 재사용(두 번째 실행) |
+|---|---|---|
+| quicsync | 4.63초 | 2.35초 |
+| rsync+ssh | 4.36초 | 2.08초 |
+
+재사용을 켠 첫 실행은 공유 연결을 여느라 4.63초가 걸렸다.
+
+`Host`에는 quicsync에 넘기는 호스트 이름과 맞는 패턴을 써야 한다. quicsync는 QUIC 연결을 맺을 때 SSH 별칭을 해석하지 않는다.
+
 ### 웹 모니터
 
 `--web`을 붙이면 전송을 브라우저에서 지켜볼 수 있다. 전송이 도는 동안 quicsync가 localhost 전용 HTTP 서버를 띄우며, 외부 의존성은 없다. `127.0.0.1`의 임의 포트에 바인딩하고, URL을 stderr에 출력한 뒤 브라우저를 대신 열어 준다.

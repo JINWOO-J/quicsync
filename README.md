@@ -144,6 +144,30 @@ The check does not detect packet loss. On a lossy link, rsync over SSH can be mu
 
 The check always uses port 22. It does not read the port from your SSH config. When the check selects rsync over SSH, the remote sshd log can record one closed connection from the check.
 
+### SSH connection reuse
+
+Each transfer opens a new SSH connection. At high RTT, the SSH setup takes many round trips. quicsync runs `ssh` without extra options, so it uses your `~/.ssh/config`. If you send to the same host again and again, add a ControlMaster block to reuse one SSH connection:
+
+```sshconfig
+Host example.com
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    ControlPersist 10m
+```
+
+The first transfer opens the shared connection. Later transfers to the same host use it until `ControlPersist` expires. rsync over SSH from `--transport=auto` uses the same connection. A background ssh process stays open after the transfer. To close it now, run `ssh -O exit example.com`.
+
+These values are for a pull of 3 files of 10 KB at 200 ms RTT, 1 run each:
+
+| | No reuse | Reuse (2nd run) |
+|---|---|---|
+| quicsync | 4.63 s | 2.35 s |
+| rsync+ssh | 4.36 s | 2.08 s |
+
+The first run with reuse took 4.63 s, because it opens the shared connection.
+
+The `Host` pattern must match the host name that you give to quicsync. quicsync does not resolve SSH aliases for the QUIC connection.
+
 ### Web monitor
 
 Pass `--web` to watch the transfer in your browser. quicsync runs a localhost-only HTTP server for the length of the transfer, with no extra dependencies. It binds `127.0.0.1` on an ephemeral port, prints the URL to stderr, and opens the browser for you.
