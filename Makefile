@@ -1,10 +1,12 @@
-.PHONY: build release test check clean install release-all dist dist-bump bump
+.PHONY: build release test check clean install install-remote release-all dist dist-bump bump
 
 UNAME_S := $(shell uname -s)
 
 # macOS에서 Linux 타겟은 cross 필요, Linux에서는 cargo로 직접 빌드
 ifeq ($(UNAME_S),Darwin)
   CROSS_CMD = cross
+  # cross 0.2.5 이미지는 amd64 manifest만 있어 Apple Silicon에서 pull이 실패한다.
+  export CROSS_CONTAINER_OPTS ?= --platform linux/amd64
 else
   CROSS_CMD = cargo
 endif
@@ -52,6 +54,30 @@ release-x86-linux:
 
 release-arm-linux:
 	$(CROSS_CMD) build --release --target aarch64-unknown-linux-gnu
+
+# 릴리스 전 빌드를 원격에 설치한다. `quicsync install-remote`는 원격 아키텍처가
+# 로컬과 다르면 GitHub 릴리스 자산을 받으므로, 릴리스되지 않은 빌드는 배포할 수 없다.
+# 사용법: make install-remote REMOTE=root@jwserver68 ARCH=x86_64 [REMOTE_OS=linux|macos] [INSTALL_DIR=/usr/local/bin]
+# 기본 설치 경로(~/.local/bin)는 quicsync가 원격 서버를 띄울 때 PATH 맨 앞에 두는 경로다.
+REMOTE_OS ?= linux
+INSTALL_DIR ?= $$HOME/.local/bin
+ifeq ($(REMOTE_OS),macos)
+  REMOTE_TRIPLE = $(ARCH)-apple-darwin
+  REMOTE_BUILD_CMD = cargo
+else
+  REMOTE_TRIPLE = $(ARCH)-unknown-linux-gnu
+  REMOTE_BUILD_CMD = $(CROSS_CMD)
+endif
+
+install-remote:
+	@[ -n "$(REMOTE)" ] || { echo "REMOTE=user@host 를 지정하세요"; exit 1; }
+	@case "$(ARCH)" in x86_64|aarch64) ;; *) echo "ARCH=x86_64|aarch64 를 지정하세요 (입력: '$(ARCH)')"; exit 1;; esac
+	@case "$(REMOTE_OS)" in linux|macos) ;; *) echo "REMOTE_OS=linux|macos 를 지정하세요 (입력: '$(REMOTE_OS)')"; exit 1;; esac
+	$(REMOTE_BUILD_CMD) build --release --target $(REMOTE_TRIPLE)
+	ssh $(REMOTE) 'set -eu; dir="$(INSTALL_DIR)"; mkdir -p "$$dir"; tmp="$$dir/.quicsync.tmp.$$$$"; \
+		cat > "$$tmp"; chmod 0755 "$$tmp"; "$$tmp" --version >/dev/null; \
+		mv "$$tmp" "$$dir/quicsync"; echo "installed: $$dir/quicsync ($$("$$dir/quicsync" --version))"' \
+		< target/$(REMOTE_TRIPLE)/release/quicsync
 
 # 전체 릴리스: native + 가능한 cross 타겟
 release-all: release
