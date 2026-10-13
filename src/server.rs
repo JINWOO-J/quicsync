@@ -15,6 +15,10 @@ use crate::quic::{
 };
 use crate::types::AuthToken;
 
+/// rsync ↔ QUIC 중계 버퍼 크기.
+/// 기본 8KB 복사는 RTT가 높을 때 QUIC 송신 측에 데이터를 충분히 공급하지 못해 처리량을 제한한다.
+const RELAY_BUF_SIZE: usize = 1024 * 1024;
+
 /// 원격 서버: QUIC 리스닝 → 토큰 검증 → rsync 중계
 pub struct RemoteServer {
     pub endpoint: quinn::Endpoint,
@@ -116,7 +120,7 @@ impl RemoteServer {
             .await
             .map_err(|e| ServerError::RelayError(format!("accept_bi: {e}")))?;
 
-        let mut reader = BufReader::new(recv_stream);
+        let mut reader = BufReader::with_capacity(RELAY_BUF_SIZE, recv_stream);
 
         // 3. 토큰 라인 읽기 및 검증
         let mut token_line = String::new();
@@ -175,14 +179,14 @@ impl RemoteServer {
         // 클라이언트는 서버 finish()를 기다리므로 순환 대기가 발생한다.
         // 따라서 rsync_to_quic 완료 후 quic_to_rsync를 abort한다.
         let quic_to_rsync = tokio::spawn(async move {
-            let r = tokio::io::copy(&mut reader, &mut child_stdin).await;
+            let r = tokio::io::copy_buf(&mut reader, &mut child_stdin).await;
             let _ = child_stdin.shutdown().await;
             r
         });
 
-        let mut stdout_reader = tokio::io::BufReader::new(child_stdout);
+        let mut stdout_reader = BufReader::with_capacity(RELAY_BUF_SIZE, child_stdout);
         let rsync_to_quic = tokio::spawn(async move {
-            let r = tokio::io::copy(&mut stdout_reader, &mut send_stream).await;
+            let r = tokio::io::copy_buf(&mut stdout_reader, &mut send_stream).await;
             if r.is_ok() {
                 let _ = send_stream.finish();
             }
