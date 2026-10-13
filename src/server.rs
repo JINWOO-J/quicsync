@@ -153,11 +153,13 @@ impl RemoteServer {
         let rsync_args: Vec<String> = rsync_args.iter().map(|a| expand_tilde(a)).collect();
 
         // 5. rsync 서버 프로세스 spawn (stdin/stdout 파이프)
+        // stderr는 SSH 채널로 그대로 내보낸다. 멀티플렉싱 전에 난 rsync 오류(알 수 없는 옵션 등)는
+        // stderr로만 나오므로, rsync over SSH처럼 클라이언트가 볼 수 있어야 한다.
         let mut child = Command::new("rsync")
             .args(&rsync_args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
             .spawn()
             .map_err(|e| ServerError::RsyncSpawnFailed(e.to_string()))?;
 

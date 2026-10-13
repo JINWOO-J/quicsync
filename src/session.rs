@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use crate::buffer::BufferLayer;
 use crate::error::{SessionError, SshError};
@@ -21,6 +22,8 @@ use crate::types::{CliArgs, StatsFormat};
 /// 세션: SSH → QUIC → TCP_Proxy → rsync 전체 파이프라인을 관리한다.
 pub struct Session {
     ssh_process: tokio::process::Child,
+    /// SSH stderr(원격 서버와 rsync의 stderr)를 로컬 stderr로 복사하는 task. SSH가 끝나면 종료된다.
+    remote_stderr: Option<JoinHandle<()>>,
     tunnel: QuicTunnel,
     rsync: RsyncChild,
     started_at: std::time::Instant,
@@ -135,7 +138,13 @@ impl Session {
             );
         }
 
-        let ssh_process = handshake.ssh_process;
+        let mut ssh_process = handshake.ssh_process;
+        // 원격 rsync의 시작 오류(알 수 없는 옵션 등)는 stderr로만 나오므로 rsync over SSH처럼 그대로 보여 준다.
+        let remote_stderr = ssh_process.stderr.take().map(|mut stderr| {
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await;
+            })
+        });
         let host_port = format!("{}:{}", args.remote.host, handshake.remote_port);
         let remote_addr: SocketAddr = tokio::net::lookup_host(&host_port)
             .await
@@ -301,6 +310,7 @@ impl Session {
 
         Ok(Self {
             ssh_process,
+            remote_stderr,
             tunnel,
             rsync,
             started_at,
@@ -326,6 +336,7 @@ impl Session {
 
         let Session {
             mut ssh_process,
+            remote_stderr,
             tunnel,
             rsync,
             started_at,
@@ -357,7 +368,9 @@ impl Session {
                         1
                     }
                 };
-                shutdown(tunnel, &mut ssh_process).await;
+                // 실패했을 때만 원격 오류 메시지를 마저 받는다. 성공하면 기다리지 않고 바로 끊는다.
+                let drain = if code != 0 { remote_stderr } else { None };
+                shutdown(tunnel, &mut ssh_process, drain).await;
                 cleanup_web(&web_tasks, &web_log_path);
                 let elapsed = started_at.elapsed();
 
@@ -420,12 +433,25 @@ impl Session {
     }
 }
 
+const REMOTE_STDERR_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// 정상 종료: QUIC 터널 → SSH 프로세스 순서로 정리한다. (Req 8.1)
-async fn shutdown(tunnel: QuicTunnel, ssh_process: &mut tokio::process::Child) {
+async fn shutdown(
+    tunnel: QuicTunnel,
+    ssh_process: &mut tokio::process::Child,
+    remote_stderr: Option<JoinHandle<()>>,
+) {
     tracing::info!("shutting down session...");
 
     if let Err(e) = tunnel.close().await {
         tracing::warn!("QUIC close error: {e}");
+    }
+    // SSH를 바로 끊으면 QUIC보다 늦게 도착한 원격 오류 메시지를 잃으므로, 원격 서버가 끝나
+    // SSH stderr가 EOF가 될 때까지 기다린다. 원격 서버는 SSH 끊김을 감지하려고 stdin을
+    // blocking read로 읽고 있어 stdin이 EOF가 돼야 tokio 런타임이 끝나므로 SSH stdin을 먼저 닫는다.
+    if let Some(task) = remote_stderr {
+        drop(ssh_process.stdin.take());
+        let _ = tokio::time::timeout(REMOTE_STDERR_DRAIN_TIMEOUT, task).await;
     }
     let _ = ssh_process.kill().await;
 

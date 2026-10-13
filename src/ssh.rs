@@ -41,10 +41,6 @@ pub async fn launch_remote_server(remote: &RemoteSpec) -> Result<SshHandshake, S
         .stdout
         .take()
         .ok_or_else(|| SshError::ConnectionFailed("failed to capture stdout".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| SshError::ConnectionFailed("failed to capture stderr".into()))?;
 
     let mut stdout_reader = BufReader::new(stdout);
     let mut version_line = String::new();
@@ -62,6 +58,10 @@ pub async fn launch_remote_server(remote: &RemoteSpec) -> Result<SshHandshake, S
     match read_result {
         Ok(Ok(0)) | Ok(Err(_)) => {
             // stdout이 닫혔거나 읽기 오류 — stderr에서 원인 파악
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| SshError::ConnectionFailed("failed to capture stderr".into()))?;
             let stderr_msg = read_stderr(stderr).await;
             return Err(classify_ssh_error(&stderr_msg));
         }
