@@ -75,6 +75,24 @@ pub fn generate_self_signed_cert()
     Ok((cert_der, key_der))
 }
 
+/// MTU 탐색이 찾아갈 UDP 페이로드 상한(MTU 9000 점보 프레임, IPv6 헤더 기준).
+/// quinn 기본값(1452)이면 MTU 9000 링크에서도 작은 패킷을 보내고, UDP GSO가 없는 macOS에서는
+/// 패킷마다 syscall을 하느라 송신 CPU가 먼저 포화된다. MTU 1500 경로에서는 탐색이 1452 근처에서 멈춘다.
+const MAX_UDP_PAYLOAD: u16 = 9000 - 40 - 8;
+
+/// UDP 소켓 송수신 버퍼 크기. macOS 기본 수신 버퍼(약 768KB)는 빠른 송신 측의 버스트에 넘치고,
+/// quinn이 이 손실을 MTU 블랙홀로 판단해 MTU를 1200으로 낮춘다. macOS 상한(kern.ipc.maxsockbuf 기본 8MB)에 맞춘다.
+const UDP_SOCKET_BUFFER_BYTES: libc::c_int = 8 * 1024 * 1024;
+
+/// 피어에게 알리는 수신 가능 최대 UDP 페이로드. 피어의 MTU 탐색 상한이 이 값으로 제한된다.
+fn endpoint_config() -> quinn::EndpointConfig {
+    let mut config = quinn::EndpointConfig::default();
+    config
+        .max_udp_payload_size(MAX_UDP_PAYLOAD)
+        .expect("MAX_UDP_PAYLOAD is within quinn's 1200..=65527");
+    config
+}
+
 /// BBR 혼잡 제어 + 높은 BDP 네트워크를 위한 TransportConfig 생성
 ///
 /// quinn 기본 윈도우(receive ~1.5MB, stream ~1MB)는 높은 RTT에서 병목이 된다.
@@ -88,6 +106,10 @@ fn bbr_transport_config(window_bytes: u64) -> Arc<quinn::TransportConfig> {
     transport.receive_window(window);
     transport.stream_receive_window(window);
     transport.send_window(window_bytes);
+
+    let mut mtu_discovery = quinn::MtuDiscoveryConfig::default();
+    mtu_discovery.upper_bound(MAX_UDP_PAYLOAD);
+    transport.mtu_discovery_config(Some(mtu_discovery));
 
     Arc::new(transport)
 }
@@ -149,7 +171,7 @@ pub fn build_client_config_with_fingerprint(
 /// 클라이언트 Endpoint 생성 (0.0.0.0:0 바인딩)
 pub fn build_client_endpoint() -> Result<quinn::Endpoint, QuicError> {
     let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-    quinn::Endpoint::client(addr).map_err(|e| QuicError::ConnectionFailed(e.to_string()))
+    build_endpoint(None, addr)
 }
 
 /// 서버 Endpoint 생성 (BBR 혼잡 제어 적용)
@@ -164,8 +186,44 @@ pub fn build_server_endpoint(
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
     server_config.transport = bbr_transport_config(window_bytes);
 
-    quinn::Endpoint::server(server_config, bind_addr)
+    build_endpoint(Some(server_config), bind_addr)
+}
+
+fn build_endpoint(
+    server_config: Option<quinn::ServerConfig>,
+    addr: SocketAddr,
+) -> Result<quinn::Endpoint, QuicError> {
+    let socket =
+        std::net::UdpSocket::bind(addr).map_err(|e| QuicError::ConnectionFailed(e.to_string()))?;
+    set_socket_buffer(&socket, libc::SO_RCVBUF);
+    set_socket_buffer(&socket, libc::SO_SNDBUF);
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| QuicError::ConnectionFailed("no async runtime found".to_string()))?;
+    quinn::Endpoint::new(endpoint_config(), server_config, socket, runtime)
         .map_err(|e| QuicError::ConnectionFailed(e.to_string()))
+}
+
+/// 실패해도 기본 버퍼로 동작하므로 전송은 계속한다. Linux는 net.core.rmem_max/wmem_max로 조용히 줄인다.
+fn set_socket_buffer(socket: &std::net::UdpSocket, option: libc::c_int) {
+    use std::os::fd::AsRawFd;
+
+    let size = UDP_SOCKET_BUFFER_BYTES;
+    // SAFETY: 열린 소켓 fd와 c_int 하나를 가리키는 포인터·길이를 넘긴다.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            &size as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        tracing::debug!(
+            "setsockopt({option}, {size}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
 }
 
 // --- 인증서 지문 계산 및 검증 ---
@@ -314,6 +372,14 @@ mod tests {
     #[tokio::test]
     async fn build_client_endpoint_succeeds() {
         build_client_endpoint().expect("client endpoint should bind");
+    }
+
+    #[test]
+    fn endpoint_config_advertises_jumbo_payload() {
+        assert_eq!(
+            endpoint_config().get_max_udp_payload_size(),
+            u64::from(MAX_UDP_PAYLOAD)
+        );
     }
 
     #[tokio::test]
