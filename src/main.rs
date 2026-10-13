@@ -24,7 +24,11 @@ async fn main() -> ExitCode {
     }
 
     if raw_args.iter().any(|a| a == "--server") {
-        init_tracing(0); // 서버 모드는 warn 레벨
+        // 서버의 stdout은 핸드셰이크 채널이므로 로그가 섞이지 않게 stderr로 보낸다.
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_filter(0))
+            .with_writer(std::io::stderr)
+            .init();
         return run_server().await;
     }
 
@@ -268,11 +272,17 @@ fn extract_rsync_server_args(raw_args: &[String]) -> Vec<String> {
 }
 
 /// verbosity 레벨에 따라 tracing을 초기화한다.
-/// RUST_LOG 환경변수가 설정되어 있으면 그것을 우선한다.
 fn init_tracing(verbosity: usize) {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_filter(verbosity))
+        .init();
+}
+
+/// RUST_LOG 환경변수가 설정되어 있으면 그것을 우선한다.
+fn tracing_filter(verbosity: usize) -> tracing_subscriber::EnvFilter {
     use tracing_subscriber::EnvFilter;
 
-    let filter = if std::env::var("RUST_LOG").is_ok() {
+    if std::env::var("RUST_LOG").is_ok() {
         EnvFilter::from_default_env()
     } else {
         let level = match verbosity {
@@ -282,9 +292,7 @@ fn init_tracing(verbosity: usize) {
             _ => "quicsync=trace",
         };
         EnvFilter::new(level)
-    };
-
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 }
 
 /// --server 모드: 원격 호스트에서 SSH를 통해 실행된다.
