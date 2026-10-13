@@ -260,6 +260,20 @@ Packet loss changes the result. These values are for a 1 GB file at 5 ms RTT, 1 
 | 0.5% | 14.3 MB/s (stopped at 60 s) | 127.8 MB/s (8.0 s) |
 | 1% | 5.2 MB/s (stopped at 60 s) | 128.8 MB/s (8.0 s) |
 
+### Jumbo-frame links
+
+A Mac (M4 Max) and a second Mac (M1 Pro) use a Thunderbolt bridge. The link MTU is 9000 and the RTT is 0.7 ms. Each value is the time for one 1 GB file, in seconds. Ranges are from 2 to 4 runs. rsync+ssh ran once.
+
+| | pull | push |
+|---|---|---|
+| rsync+ssh | 2.28 | 1.95 |
+| quicsync 0.6.0 (`--transport=quic`) | 14.2–15.4 | 14.4–21.7 |
+| quicsync, MTU limit 8952 (`--transport=quic`) | 3.23–3.30 | 3.11–3.15 |
+
+macOS has no UDP GSO, so quicsync makes one system call for each packet. With the quinn default limit of 1452 bytes, the sender CPU limits the transfer. quicsync now lets MTU discovery go up to 8952 bytes and sets 8 MB UDP socket buffers. The larger receive buffer also stops a loss pattern that made quinn drop the MTU to 1200.
+
+Both hosts must run a quicsync version with this change. At this RTT, `--transport=auto` selects rsync over SSH, which is still faster on this link.
+
 ### Running the benchmarks
 
 ```bash

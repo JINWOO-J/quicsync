@@ -260,6 +260,20 @@ VM이 bare-metal 호스트로 보내는(pull) 구성이다. 지연과 손실은 
 | 0.5% | 14.3 MB/s (60초에서 중단) | 127.8 MB/s (8.0초) |
 | 1% | 5.2 MB/s (60초에서 중단) | 128.8 MB/s (8.0초) |
 
+### 점보 프레임 링크
+
+Mac(M4 Max)과 Mac(M1 Pro)을 Thunderbolt 브리지로 연결해 측정했다. 링크 MTU는 9000, RTT는 0.7ms다. 값은 1GB 파일 하나를 보낸 시간(초)이며, 범위는 2~4회 측정값이고 rsync+ssh는 1회 측정했다.
+
+| | pull | push |
+|---|---|---|
+| rsync+ssh | 2.28 | 1.95 |
+| quicsync 0.6.0 (`--transport=quic`) | 14.2~15.4 | 14.4~21.7 |
+| quicsync, MTU 상한 8952 (`--transport=quic`) | 3.23~3.30 | 3.11~3.15 |
+
+macOS에는 UDP GSO가 없어 quicsync가 패킷마다 시스템 호출을 한다. quinn 기본 상한인 1452바이트 패킷으로는 송신 측 CPU가 먼저 한계에 닿는다. 그래서 MTU 탐색 상한을 8952바이트로 올리고 UDP 소켓 버퍼를 8MB로 늘렸다. 수신 버퍼가 커지면서, 버퍼가 넘쳐 생긴 손실 때문에 quinn이 MTU를 1200으로 낮추던 현상도 사라졌다.
+
+양쪽 호스트 모두 이 변경이 들어간 quicsync를 써야 한다. 이 RTT에서는 `--transport=auto`가 rsync over SSH를 고르며, 이 링크에서는 그쪽이 여전히 빠르다.
+
 ### 벤치마크 실행
 
 ```bash
