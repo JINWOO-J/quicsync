@@ -91,7 +91,18 @@ quicsync --install-remote /src user@host:/dst
 quicsync --fallback=rsync /src user@host:/dst
 ```
 
-quicsync가 rsync에 `--stats`를 대신 붙여 주므로, 전송이 끝나면 rsync 요약이 출력된다. quicsync 자체 통계도 보고 싶으면 `--stats`를 직접 붙인다. QUIC 터널로 보낼 때는 시작할 때 방향과 경로를, 끝날 때 경과 시간을 출력한다.
+시작할 때 전송 방향, 경로, 고른 전송 경로를 출력한다. 터미널에서는 진행 줄 하나를 갱신하다가 끝나면 요약 한 줄로 바꾼다.
+
+```text
+quicsync 0.6.1 · push ~/work/app → user@host:/dst
+경로: QUIC (RTT 12.3ms)
+⠹ QUIC 54% · 829.1 MB · 129.5 MB/s · 8s · 파일 3,319/4,344+
+✓ 완료 · 17.9s · 파일 45,503개 · 2.3 GB (전송 1.1 GB, 압축 2.2배) · 평균 59.9 MB/s · QUIC
+```
+
+진행 줄은 rsync의 `--info=progress2`를 읽으므로 로컬 rsync가 3.1 이상이어야 한다. 전송량은 압축 전 파일 크기 기준이고, 파일 수 뒤의 `+`는 rsync가 아직 파일 목록을 만드는 중이라는 뜻이다.
+
+출력이 터미널이 아니거나 `--no-progress`를 주면 예전처럼 rsync의 `--stats` 요약 전체가 나온다. `-v`를 줘도 전체 요약이 나오고, `-P`, `--progress`, `--info=...`를 주면 rsync 자체 진행 출력을 그대로 보인다. quicsync 자체 전송 통계는 `--stats`로 본다. `NO_COLOR`를 설정하면 색을 쓰지 않는다.
 
 ### 지원하는 경로 형식
 

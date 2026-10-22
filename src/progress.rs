@@ -21,6 +21,7 @@ impl ProgressUI {
         }
 
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        let mut line = ProgressLine::default();
         loop {
             interval.tick().await;
 
@@ -36,24 +37,76 @@ impl ProgressUI {
                 "TCP"
             };
 
-            let speed = format_speed(snap.throughput_bps);
-            let transferred = format_bytes(snap.bytes_transferred);
-            let total = format_bytes(
-                self.metrics
-                    .total_bytes
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            );
-
-            let eta = match self.metrics.eta_secs() {
-                Some(secs) => format!("ETA {}", format_eta(secs)),
-                None => "ETA --".to_string(),
-            };
-
-            eprint!(
-                "\r[{}] {} | {} | {} / {}",
-                mode, speed, eta, transferred, total
+            line.draw(
+                mode,
+                snap.throughput_bps,
+                snap.bytes_transferred,
+                self.metrics.start_time.elapsed().as_secs_f64(),
             );
         }
+    }
+}
+
+/// stderr 한 줄을 `\r`로 덮어쓰며 진행 상태를 그린다.
+#[derive(Default)]
+pub struct ProgressLine {
+    prev_len: usize,
+    frame: usize,
+}
+
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+impl ProgressLine {
+    /// QUIC 경로에서 rsync 진행 정보를 쓸 수 없을 때 터널 바이트로 그린다.
+    pub fn draw(&mut self, mode: &str, speed_bps: f64, bytes: u64, elapsed_secs: f64) {
+        self.draw_text(&format!(
+            "{mode} {} · {} · {}",
+            format_bytes(bytes),
+            format_speed(speed_bps),
+            format_eta(elapsed_secs)
+        ));
+    }
+
+    pub fn draw_text(&mut self, text: &str) {
+        let spinner = SPINNER[self.frame % SPINNER.len()];
+        self.frame += 1;
+        let mut line: String = format!("{spinner} {text}");
+        // 터미널 폭을 넘으면 줄이 바뀌어 \r 덮어쓰기가 깨지므로 폭보다 한 칸 짧게 자른다.
+        if let Some(width) = crate::ui::terminal_width() {
+            line = line.chars().take(width.saturating_sub(1)).collect();
+        }
+        let len = line.chars().count();
+        // 이전 줄이 더 길었으면 남은 글자를 공백으로 덮는다. 줄 지우기 escape(\x1b[2K)는 일부 터미널에서 줄이 보이지 않았다.
+        let pad = self.prev_len.saturating_sub(len);
+        self.prev_len = len;
+        self.write(&format!("\r{line}{}", " ".repeat(pad)));
+    }
+
+    pub fn is_drawn(&self) -> bool {
+        self.prev_len > 0
+    }
+
+    /// 진행 줄을 남겨 둔 채 줄을 바꾼다. 이후 출력이 진행 줄 뒤에 붙지 않게 한다.
+    pub fn finish(&mut self) {
+        if self.prev_len > 0 {
+            self.write("\n");
+            self.prev_len = 0;
+        }
+    }
+
+    /// 진행 줄을 공백으로 덮어 지운다. 완료 요약이 그 자리에 나온다.
+    pub fn clear(&mut self) {
+        if self.prev_len > 0 {
+            self.write(&format!("\r{}\r", " ".repeat(self.prev_len)));
+            self.prev_len = 0;
+        }
+    }
+
+    /// 줄 전체를 한 번의 write로 내보낸다.
+    fn write(&self, text: &str) {
+        let mut err = std::io::stderr().lock();
+        let _ = std::io::Write::write_all(&mut err, text.as_bytes());
+        let _ = std::io::Write::flush(&mut err);
     }
 }
 

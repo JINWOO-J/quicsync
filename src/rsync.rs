@@ -10,6 +10,8 @@ use crate::types::{RemoteSpec, TransferDirection};
 
 pub struct RsyncChild {
     pub(crate) process: Child,
+    /// `--info=progress2`와 `--stats` 출력을 진행 줄·요약으로 바꾸는 task
+    output_task: Option<tokio::task::JoinHandle<crate::ui::RsyncReport>>,
 }
 
 /// rsync `--log-file` 한 줄에서 추출한 전송 항목.
@@ -156,6 +158,241 @@ pub fn build_rsync_args(
     args
 }
 
+/// 진행 표시를 켤 수 있으면 `--info=progress2`를 붙이고 true를 돌려준다.
+fn plan_progress(args: &mut Vec<String>, rsync_options: &[String], show_progress: bool) -> bool {
+    let enabled =
+        show_progress && !has_progress_option(rsync_options) && local_rsync_supports_info();
+    if enabled {
+        args.insert(0, "--info=progress2".to_string());
+    }
+    enabled
+}
+
+/// 사용자가 rsync 진행 출력을 직접 고른 경우 그대로 둔다.
+pub(crate) fn has_progress_option(opts: &[String]) -> bool {
+    opts.iter().any(|o| {
+        o == "--progress"
+            || o.starts_with("--info")
+            || (o.starts_with('-') && !o.starts_with("--") && o.contains('P'))
+    })
+}
+
+/// `--info=progress2`는 rsync 3.1부터 있다. macOS 기본 openrsync는 2.6.9 호환이라 지원하지 않는다.
+fn local_rsync_supports_info() -> bool {
+    std::process::Command::new("rsync")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| parse_rsync_version(&String::from_utf8_lossy(&o.stdout)))
+        .is_some_and(|v| v >= (3, 1))
+}
+
+/// `rsync --version` 출력에서 (major, minor)를 꺼낸다.
+fn parse_rsync_version(text: &str) -> Option<(u32, u32)> {
+    // openrsync는 `protocol version 29` 뒤에 `rsync version 2.6.9`를 출력하므로 점이 있는 첫 값을 쓴다.
+    let ver = text
+        .split("version")
+        .skip(1)
+        .filter_map(|after| after.split_whitespace().next())
+        .find(|v| v.contains('.'))?;
+    let mut parts = ver.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+/// `--info=progress2` 한 조각에서 읽은 전체 진행 상태.
+/// 예: `  1,234,567  45%   12.34MB/s    0:00:05 (xfr#12, to-chk=30/100)`
+#[derive(Debug, PartialEq, Eq)]
+struct Progress2 {
+    bytes: u64,
+    percent: u8,
+    files_done: Option<u64>,
+    files_total: Option<u64>,
+    /// `ir-chk`: rsync가 아직 파일 목록을 만드는 중이라 전체 파일 수가 늘어날 수 있다.
+    scanning: bool,
+}
+
+fn parse_progress2(segment: &str) -> Option<Progress2> {
+    let mut tokens = segment.split_whitespace();
+    let bytes: u64 = tokens.next()?.replace(',', "").parse().ok()?;
+    let percent: u8 = tokens.next()?.strip_suffix('%')?.parse().ok()?;
+    if !tokens.next()?.ends_with("/s") {
+        return None;
+    }
+    let mut progress = Progress2 {
+        bytes,
+        percent,
+        files_done: None,
+        files_total: None,
+        scanning: false,
+    };
+    if let Some(idx) = segment.find("-chk=") {
+        progress.scanning = segment[..idx].ends_with("ir");
+        let rest = segment[idx + 5..].trim().trim_end_matches(')');
+        if let Some((remaining, total)) = rest.split_once('/')
+            && let (Ok(remaining), Ok(total)) = (remaining.parse::<u64>(), total.parse::<u64>())
+        {
+            progress.files_done = Some(total.saturating_sub(remaining));
+            progress.files_total = Some(total);
+        }
+    }
+    Some(progress)
+}
+
+/// `--stats` 블록의 한 줄을 읽어 report에 반영한다.
+fn parse_stats_line(line: &str, report: &mut crate::ui::RsyncReport) {
+    let value = |prefix: &str| -> Option<u64> {
+        let rest = line.strip_prefix(prefix)?;
+        rest.split_whitespace()
+            .next()?
+            .replace(',', "")
+            .parse()
+            .ok()
+    };
+    if let Some(v) = value("Number of regular files transferred:") {
+        report.files_transferred = Some(v);
+    } else if let Some(v) = value("Total transferred file size:") {
+        report.transferred_size = Some(v);
+    } else if let Some(v) = value("Total bytes sent:") {
+        report.bytes_sent = Some(v);
+    } else if let Some(v) = value("Total bytes received:") {
+        report.bytes_received = Some(v);
+    }
+}
+
+/// 사용자가 rsync의 자세한 출력을 원하면 통계 원문도 그대로 보인다.
+fn wants_raw_stats(opts: &[String]) -> bool {
+    opts.iter().any(|o| {
+        o == "--verbose"
+            || o.starts_with("--info=stats")
+            || (o.starts_with('-') && !o.starts_with("--") && o.contains('v'))
+    })
+}
+
+/// 진행 줄에 쓰는 최근 처리량. rsync가 표시하는 값은 파일 하나 기준이라 직접 계산한다.
+struct RecentSpeed {
+    samples: std::collections::VecDeque<(std::time::Instant, u64)>,
+}
+
+impl RecentSpeed {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+    fn push(&mut self, now: std::time::Instant, bytes: u64) -> f64 {
+        self.samples.push_back((now, bytes));
+        while self.samples.len() > 2 && now.duration_since(self.samples[0].0) > Self::WINDOW {
+            self.samples.pop_front();
+        }
+        let (t0, b0) = self.samples[0];
+        let secs = now.duration_since(t0).as_secs_f64();
+        if secs <= 0.0 {
+            0.0
+        } else {
+            bytes.saturating_sub(b0) as f64 / secs
+        }
+    }
+}
+
+fn progress2_text(label: &str, p: &Progress2, speed: f64, elapsed: f64) -> String {
+    let mut text = format!(
+        "{label} {}% · {} · {} · {}",
+        p.percent,
+        crate::progress::format_bytes(p.bytes),
+        crate::progress::format_speed(speed),
+        crate::progress::format_eta(elapsed)
+    );
+    if let (Some(done), Some(total)) = (p.files_done, p.files_total) {
+        let more = if p.scanning { "+" } else { "" };
+        text.push_str(&format!(
+            " · 파일 {}/{}{more}",
+            crate::ui::group_digits(done),
+            crate::ui::group_digits(total)
+        ));
+    }
+    text
+}
+
+/// rsync stdout을 읽어 progress2는 진행 줄로 그리고, `--stats` 블록은 요약용으로 읽는다.
+/// 통계 원문은 `raw_stats`일 때만 보이고, 그 밖의 출력은 그대로 stdout에 넘긴다.
+async fn relay_rsync_output(
+    mut stdout: tokio::process::ChildStdout,
+    label: &'static str,
+    raw_stats: bool,
+) -> crate::ui::RsyncReport {
+    use std::io::Write;
+    use tokio::io::AsyncReadExt;
+
+    let started = std::time::Instant::now();
+    let mut line = crate::progress::ProgressLine::default();
+    let mut speed = RecentSpeed {
+        samples: std::collections::VecDeque::new(),
+    };
+    let mut report = crate::ui::RsyncReport::default();
+    let mut in_stats = false;
+    let mut blank_lines = 0usize;
+    let mut last_draw: Option<std::time::Instant> = None;
+    let mut pending = Vec::new();
+    let mut buf = [0u8; 8192];
+    let write_out = |bytes: &[u8]| {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(bytes);
+        let _ = out.flush();
+    };
+    loop {
+        let n = match stdout.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        pending.extend_from_slice(&buf[..n]);
+        while let Some(pos) = pending.iter().position(|&b| b == b'\r' || b == b'\n') {
+            let sep = pending[pos];
+            let segment: Vec<u8> = pending.drain(..=pos).collect();
+            let text = String::from_utf8_lossy(&segment[..segment.len() - 1]).to_string();
+            let trimmed = text.trim();
+            if let Some(p) = parse_progress2(&text) {
+                let now = std::time::Instant::now();
+                let current = speed.push(now, p.bytes);
+                if last_draw.is_none_or(|t| now.duration_since(t).as_millis() >= 250) {
+                    let elapsed = started.elapsed().as_secs_f64();
+                    line.draw_text(&progress2_text(label, &p, current, elapsed));
+                    last_draw = Some(now);
+                }
+                continue;
+            }
+            if trimmed.starts_with("Number of files:") {
+                in_stats = true;
+            }
+            if in_stats {
+                parse_stats_line(trimmed, &mut report);
+                let ends = trimmed.starts_with("total size is");
+                if raw_stats {
+                    line.finish();
+                    write_out(&segment);
+                }
+                if ends {
+                    in_stats = false;
+                }
+                continue;
+            }
+            if trimmed.is_empty() {
+                // 빈 줄은 다음 출력이 있을 때만 내보낸다. 통계를 숨길 때 앞뒤로 빈 줄만 남지 않게 한다.
+                if sep == b'\n' {
+                    blank_lines += 1;
+                }
+                continue;
+            }
+            line.finish();
+            for _ in 0..std::mem::take(&mut blank_lines) {
+                write_out(b"\n");
+            }
+            write_out(&segment);
+        }
+    }
+    line.clear();
+    if !pending.is_empty() {
+        write_out(&pending);
+    }
+    report
+}
+
 /// fallback용 순정 rsync-over-SSH 인수를 구성한다.
 pub fn build_direct_rsync_args(
     rsync_options: &[String],
@@ -203,8 +440,10 @@ impl RsyncChild {
         proxy_port: u16,
         direction: TransferDirection,
         log_path: Option<&std::path::Path>,
+        show_progress: bool,
     ) -> Result<Self, RsyncError> {
         let mut args = build_rsync_args(rsync_options, local_paths, remote, proxy_port, direction);
+        let summarize = plan_progress(&mut args, rsync_options, show_progress);
 
         // --web 모니터링용 파일 이벤트 로그. stdout(사용자 출력)은 건드리지 않고
         // 별도 로그 파일에 파일 단위 항목을 기록하게 한다.
@@ -214,16 +453,46 @@ impl RsyncChild {
         }
 
         tracing::debug!("rsync spawn: rsync {}", args.join(" "));
+        Self::spawn_with_output(&args, summarize, "QUIC", rsync_options)
+    }
 
-        let process = Command::new("rsync")
-            .args(&args)
+    fn spawn_with_output(
+        args: &[String],
+        summarize: bool,
+        label: &'static str,
+        rsync_options: &[String],
+    ) -> Result<Self, RsyncError> {
+        let mut process = Command::new("rsync")
+            .args(args)
             .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
+            .stdout(if summarize {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            })
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| RsyncError::SpawnFailed(e.to_string()))?;
 
-        Ok(Self { process })
+        let raw_stats = wants_raw_stats(rsync_options);
+        let output_task = if summarize {
+            process
+                .stdout
+                .take()
+                .map(|stdout| tokio::spawn(relay_rsync_output(stdout, label, raw_stats)))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            process,
+            output_task,
+        })
+    }
+
+    /// 진행 줄과 완료 요약을 rsync 출력에서 만드는지 여부. 아니면 rsync 출력이 그대로 보인다.
+    pub fn summarizes(&self) -> bool {
+        self.output_task.is_some()
     }
 
     /// 순정 rsync-over-SSH fallback 프로세스를 실행한다.
@@ -232,19 +501,12 @@ impl RsyncChild {
         local_paths: &[PathBuf],
         remote: &RemoteSpec,
         direction: TransferDirection,
+        show_progress: bool,
     ) -> Result<Self, RsyncError> {
-        let args = build_direct_rsync_args(rsync_options, local_paths, remote, direction);
+        let mut args = build_direct_rsync_args(rsync_options, local_paths, remote, direction);
+        let summarize = plan_progress(&mut args, rsync_options, show_progress);
         tracing::debug!("rsync fallback spawn: rsync {}", args.join(" "));
-
-        let process = Command::new("rsync")
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| RsyncError::SpawnFailed(e.to_string()))?;
-
-        Ok(Self { process })
+        Self::spawn_with_output(&args, summarize, "RSYNC", rsync_options)
     }
 
     /// rsync 종료를 비동기로 대기하고 종료 코드를 반환한다.
@@ -253,12 +515,23 @@ impl RsyncChild {
     /// - 종료 코드 != 0: stderr를 출력하고 RsyncError::ExitCode 반환 (Req 7.4)
     /// - 시그널로 종료: stderr를 출력하고 RsyncError::Signal 반환
     pub async fn wait(self) -> Result<i32, RsyncError> {
-        let output = self
-            .process
-            .wait_with_output()
-            .await
-            .map_err(|e| RsyncError::SpawnFailed(e.to_string()))?;
+        self.wait_report().await.0
+    }
 
+    /// 종료 코드와 함께, 출력을 요약한 경우 rsync 통계에서 읽은 결과를 돌려준다.
+    pub async fn wait_report(self) -> (Result<i32, RsyncError>, Option<crate::ui::RsyncReport>) {
+        let output = match self.process.wait_with_output().await {
+            Ok(o) => o,
+            Err(e) => return (Err(RsyncError::SpawnFailed(e.to_string())), None),
+        };
+        let report = match self.output_task {
+            Some(task) => task.await.ok(),
+            None => None,
+        };
+        (Self::exit_result(&output), report)
+    }
+
+    fn exit_result(output: &std::process::Output) -> Result<i32, RsyncError> {
         match output.status.code() {
             Some(0) => Ok(0),
             Some(code) => {
@@ -285,6 +558,68 @@ impl RsyncChild {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn parse_rsync_version_reads_major_minor() {
+        assert_eq!(
+            parse_rsync_version("rsync  version 3.5.1  protocol version 33\n"),
+            Some((3, 5))
+        );
+        assert_eq!(
+            parse_rsync_version("openrsync: protocol version 29\nrsync version 2.6.9 compatible\n"),
+            Some((2, 6))
+        );
+    }
+
+    #[test]
+    fn parse_progress2_reads_bytes_percent_and_files() {
+        let p = parse_progress2("    373,031,424  16%   88.30MB/s    0:00:04 (xfr#120, to-chk=30/100)")
+            .unwrap();
+        assert_eq!(p.bytes, 373_031_424);
+        assert_eq!(p.percent, 16);
+        assert_eq!((p.files_done, p.files_total), (Some(70), Some(100)));
+        assert!(!p.scanning);
+        let scanning = parse_progress2("  1,024   0%    1.00kB/s    0:00:00 (xfr#1, ir-chk=1000/1200)")
+            .unwrap();
+        assert!(scanning.scanning);
+        assert_eq!(parse_progress2("Number of files: 48,912"), None);
+        assert_eq!(parse_progress2("sent 1,513,918 bytes  received 4,239 bytes"), None);
+    }
+
+    #[test]
+    fn parse_stats_line_reads_summary_fields() {
+        let mut r = crate::ui::RsyncReport::default();
+        for l in [
+            "Number of regular files transferred: 45,503",
+            "Total transferred file size: 2,323,408,940 bytes",
+            "Total bytes sent: 1,074,152,008",
+            "Total bytes received: 883,337",
+            "Literal data: 2,323,408,940 bytes",
+        ] {
+            parse_stats_line(l, &mut r);
+        }
+        assert_eq!(r.files_transferred, Some(45_503));
+        assert_eq!(r.transferred_size, Some(2_323_408_940));
+        assert_eq!(r.bytes_sent, Some(1_074_152_008));
+        assert_eq!(r.bytes_received, Some(883_337));
+    }
+
+    #[test]
+    fn wants_raw_stats_detects_verbose() {
+        assert!(wants_raw_stats(&["-avz".to_string()]));
+        assert!(wants_raw_stats(&["--info=stats2".to_string()]));
+        assert!(!wants_raw_stats(&["-az".to_string()]));
+    }
+
+    #[test]
+    fn has_progress_option_detects_user_progress() {
+        assert!(has_progress_option(&["-avP".to_string()]));
+        assert!(has_progress_option(&["--info=progress2".to_string()]));
+        assert!(!has_progress_option(&[
+            "-az".to_string(),
+            "--partial".to_string()
+        ]));
+    }
 
     // --- has_recursive_flag 단위 테스트 ---
 
@@ -642,7 +977,10 @@ mod tests {
                     .spawn()
                     .expect("failed to spawn sh");
 
-                let child = RsyncChild { process };
+                let child = RsyncChild {
+                    process,
+                    output_task: None,
+                };
                 let result = child.wait().await;
                 let code_i32 = code as i32;
 

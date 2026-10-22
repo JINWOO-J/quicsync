@@ -291,8 +291,9 @@ fn tracing_filter(verbosity: usize) -> tracing_subscriber::EnvFilter {
         EnvFilter::from_default_env()
     } else {
         let level = match verbosity {
-            0 => "warn",
-            1 => "quicsync=info",
+            // 기본 출력에는 사용자 메시지만 남긴다. 경고 로그는 -v부터 보인다.
+            0 => "error",
+            1 => "warn,quicsync=info",
             2 => "quicsync=debug",
             _ => "quicsync=trace",
         };
@@ -322,21 +323,25 @@ async fn run_client(raw_args: &[String]) -> ExitCode {
     let args = match parse_args(raw_args) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("quicsync: {e}");
+            quicsync::ui::error(&e.to_string());
             return ExitCode::FAILURE;
         }
     };
+
+    quicsync::ui::header(args.direction, &args.local_paths, &args.remote);
 
     // 재귀 옵션이 없으면 rsync가 디렉토리를 건너뛰어(skipping directory) 0개가 전송된다.
     // 막지는 않되(최상위 파일만 전송하려는 경우도 있으므로) 사용자에게 명확히 알린다.
     // 순정 rsync 경로는 정상 종료 시 rsync stderr를 보여 주지 않으므로 경로를 고르기 전에 출력한다.
     if !quicsync::rsync::has_recursive_flag(&args.rsync_options) {
-        eprintln!(
-            "quicsync: 경고 — 재귀 옵션(-a, -r 등)이 없어 디렉토리는 복사되지 않습니다(rsync가 건너뜀).\n          디렉토리를 동기화하려면 -a 를 추가하거나 QUICSYNC_DEFAULT_ARGS=-a 를 설정하세요."
+        quicsync::ui::warn(
+            "재귀 옵션(-a, -r 등)이 없어 디렉토리는 복사되지 않습니다. -a를 추가하거나 QUICSYNC_DEFAULT_ARGS=-a를 설정하세요.",
         );
     }
 
-    if should_switch_to_rsync(&args).await {
+    let (use_rsync, reason) = choose_route(&args).await;
+    quicsync::ui::route(&reason);
+    if use_rsync {
         return run_rsync_fallback(args).await;
     }
 
@@ -346,80 +351,89 @@ async fn run_client(raw_args: &[String]) -> ExitCode {
     let session = match Session::start(args).await {
         Ok(s) => s,
         Err(e) => {
+            quicsync::ui::error(&e.to_string());
             if fallback == FallbackMode::Rsync {
-                eprintln!("quicsync: {e}");
-                eprintln!("quicsync: falling back to rsync over SSH (--fallback=rsync)");
+                quicsync::ui::route("rsync over SSH (QUIC 초기화 실패, --fallback=rsync)");
                 return run_rsync_fallback(fallback_args).await;
-            } else {
-                eprintln!("quicsync: {e}");
-                return ExitCode::FAILURE;
             }
+            return ExitCode::FAILURE;
         }
     };
 
     match session.run().await {
         Ok(code) => exit_code(code),
         Err(e) => {
-            eprintln!("quicsync: {e}");
+            quicsync::ui::error(&e.to_string());
             ExitCode::FAILURE
         }
     }
 }
 
-/// RTT가 낮으면 rsync over SSH가 더 빠르므로 전환 여부를 정하고, 전환하면 사용자에게 알린다.
-/// --web, --stats는 QUIC 경로에만 있는 기능이라 요청되면 전환하지 않는다.
-async fn should_switch_to_rsync(args: &quicsync::types::CliArgs) -> bool {
+/// 전송 경로를 고르고 그 이유를 돌려준다. true면 rsync over SSH로 보낸다.
+/// RTT가 낮으면 rsync over SSH가 더 빠를 수 있다. --web, --stats는 QUIC 경로에만 있는 기능이라 요청되면 전환하지 않는다.
+async fn choose_route(args: &quicsync::types::CliArgs) -> (bool, String) {
     if args.transport != Transport::Auto {
-        return false;
+        return (false, "QUIC (지정됨)".to_string());
     }
     if args.web || args.stats {
-        tracing::info!("auto transport: --web/--stats requested, staying on QUIC");
-        return false;
+        return (false, "QUIC (--web·--stats는 QUIC에서만 동작)".to_string());
     }
-    let Some(rtt) = probe_ssh_rtt(&args.remote.host, AUTO_RSYNC_MAX_RTT).await else {
-        tracing::info!(
-            "auto transport: no SSH port response within {}ms, using QUIC",
-            AUTO_RSYNC_MAX_RTT.as_millis()
-        );
-        return false;
-    };
-    if rtt >= AUTO_RSYNC_MAX_RTT {
-        tracing::info!(
-            "auto transport: RTT {:.1}ms, using QUIC",
-            rtt.as_secs_f64() * 1000.0
-        );
-        return false;
+    let limit_ms = AUTO_RSYNC_MAX_RTT.as_millis();
+    match probe_ssh_rtt(&args.remote.host, AUTO_RSYNC_MAX_RTT).await {
+        Some(rtt) if rtt < AUTO_RSYNC_MAX_RTT => (
+            true,
+            format!(
+                "rsync over SSH (RTT {:.1}ms < {limit_ms}ms · 손실이 있는 회선이면 --transport=quic)",
+                rtt.as_secs_f64() * 1000.0
+            ),
+        ),
+        Some(rtt) => (
+            false,
+            format!("QUIC (RTT {:.1}ms)", rtt.as_secs_f64() * 1000.0),
+        ),
+        None => (
+            false,
+            format!("QUIC (RTT {limit_ms}ms 이상 또는 측정 불가)"),
+        ),
     }
-    eprintln!(
-        "quicsync: RTT가 {:.1}ms로 {}ms보다 낮아 rsync over SSH로 전송합니다.\n          손실이 있는 회선이면 QUIC이 더 빠를 수 있습니다: --transport=quic",
-        rtt.as_secs_f64() * 1000.0,
-        AUTO_RSYNC_MAX_RTT.as_millis()
-    );
-    true
 }
 
 async fn run_rsync_fallback(args: quicsync::types::CliArgs) -> ExitCode {
+    let started = std::time::Instant::now();
     let rsync = match RsyncChild::spawn_direct(
         &args.rsync_options,
         &args.local_paths,
         &args.remote,
         args.direction,
+        args.show_progress,
     ) {
         Ok(child) => child,
         Err(e) => {
-            eprintln!("quicsync fallback: {e}");
+            quicsync::ui::error(&e.to_string());
             return ExitCode::FAILURE;
         }
     };
 
-    match rsync.wait().await {
-        Ok(code) => exit_code(code),
-        Err(quicsync::error::RsyncError::ExitCode(code)) => exit_code(code),
+    let (result, report) = rsync.wait_report().await;
+    let code = match result {
+        Ok(code) => code,
+        Err(quicsync::error::RsyncError::ExitCode(code)) => code,
         Err(e) => {
-            eprintln!("quicsync fallback: {e}");
-            ExitCode::FAILURE
+            quicsync::ui::error(&e.to_string());
+            return ExitCode::FAILURE;
         }
-    }
+    };
+    eprintln!(
+        "{}",
+        quicsync::ui::finish_line(
+            code,
+            started.elapsed().as_secs_f64(),
+            "rsync over SSH",
+            args.direction,
+            report.as_ref()
+        )
+    );
+    exit_code(code)
 }
 
 /// i32 종료 코드를 ExitCode로 변환한다.

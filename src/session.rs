@@ -22,6 +22,7 @@ use crate::types::{CliArgs, StatsFormat};
 /// 세션: SSH → QUIC → TCP_Proxy → rsync 전체 파이프라인을 관리한다.
 pub struct Session {
     ssh_process: tokio::process::Child,
+    direction: crate::types::TransferDirection,
     /// SSH stderr(원격 서버와 rsync의 stderr)를 로컬 stderr로 복사하는 task. SSH가 끝나면 종료된다.
     remote_stderr: Option<JoinHandle<()>>,
     tunnel: QuicTunnel,
@@ -75,25 +76,6 @@ impl Session {
         #[cfg(feature = "otel")]
         let session_span = telemetry.as_ref().map(|t| t.start_session_span(&args));
 
-        let remote_display = match &args.remote.user {
-            Some(u) => format!("{}@{}:{}", u, args.remote.host, args.remote.path),
-            None => format!("{}:{}", args.remote.host, args.remote.path),
-        };
-        let direction_label = match args.direction {
-            crate::types::TransferDirection::Push => "push",
-            crate::types::TransferDirection::Pull => "pull",
-        };
-        eprintln!(
-            "quicsync: {} → {} ({})",
-            remote_display,
-            direction_label,
-            if args.local_paths.len() == 1 {
-                args.local_paths[0].display().to_string()
-            } else {
-                format!("{} paths", args.local_paths.len())
-            }
-        );
-
         // 1. SSH로 원격 서버 실행
         tracing::info!("launching remote server via SSH...");
         let ssh_fut = launch_remote_server(&args.remote);
@@ -110,7 +92,7 @@ impl Session {
         let handshake = match ssh_result {
             Ok(handshake) => handshake,
             Err(SshError::BinaryNotFound(e)) if args.install_remote => {
-                eprintln!("quicsync: remote quicsync not found; installing matching binary...");
+                crate::ui::info("원격에 quicsync가 없어 같은 버전을 설치합니다");
                 let version = RemoteInstaller::install_smart(&args.remote, "$HOME/.local/bin")
                     .await
                     .map_err(|install_err| {
@@ -118,7 +100,7 @@ impl Session {
                             "remote install failed after binary-not-found ({e}): {install_err}"
                         ))
                     })?;
-                eprintln!("quicsync: installed remote {version}");
+                crate::ui::info(&format!("원격 설치 완료: {version}"));
                 launch_remote_server(&args.remote)
                     .await
                     .map_err(|retry_err| SessionError::InitFailed(format!("SSH: {retry_err}")))?
@@ -132,10 +114,10 @@ impl Session {
                 Some(user) => format!("{}@{}", user, args.remote.host),
                 None => args.remote.host.clone(),
             };
-            eprintln!(
-                "quicsync: 경고 — 원격 quicsync 버전({})이 로컬({local_version})과 달라 전송이 실패할 수 있습니다.\n          버전을 맞추려면: quicsync install-remote {target}",
+            crate::ui::warn(&format!(
+                "원격 quicsync 버전({})이 로컬({local_version})과 달라 전송이 실패할 수 있습니다. 맞추려면: quicsync install-remote {target}",
                 handshake.remote_version
-            );
+            ));
         }
 
         let mut ssh_process = handshake.ssh_process;
@@ -217,6 +199,7 @@ impl Session {
             proxy_port,
             args.direction,
             web_log_path.as_deref(),
+            args.show_progress,
         )
         .map_err(|e| SessionError::InitFailed(format!("rsync: {e}")))?;
 
@@ -254,8 +237,11 @@ impl Session {
 
         // TODO: integrate encode_chunk/decode_chunk into relay when no_integrity is false
 
-        // Progress UI 스폰 (show_progress가 true일 때)
-        if args.show_progress {
+        // rsync 진행 정보를 쓸 수 없을 때만 터널 바이트로 진행 줄을 그린다. 사용자가 -P 등을 주면 rsync 출력에 맡긴다.
+        if args.show_progress
+            && !rsync.summarizes()
+            && !crate::rsync::has_progress_option(&args.rsync_options)
+        {
             let progress = ProgressUI::new(metrics.clone(), true);
             tokio::spawn(async move { progress.run().await });
         }
@@ -268,7 +254,7 @@ impl Session {
             match crate::web::bind().await {
                 Ok((listener, addr)) => {
                     let url = format!("http://{addr}");
-                    eprintln!("quicsync: web monitor → {url}");
+                    crate::ui::info(&format!("웹 모니터: {url}"));
                     open_browser(&url);
                     let web_metrics = metrics.clone();
                     web_tasks.push(tokio::spawn(async move {
@@ -276,7 +262,9 @@ impl Session {
                     }));
                 }
                 Err(e) => {
-                    eprintln!("quicsync: web monitor disabled (bind failed: {e})");
+                    crate::ui::warn(&format!(
+                        "웹 모니터를 띄우지 못했습니다(포트 바인딩 실패: {e})"
+                    ));
                 }
             }
 
@@ -310,6 +298,7 @@ impl Session {
 
         Ok(Self {
             ssh_process,
+            direction: args.direction,
             remote_stderr,
             tunnel,
             rsync,
@@ -336,6 +325,7 @@ impl Session {
 
         let Session {
             mut ssh_process,
+            direction,
             remote_stderr,
             tunnel,
             rsync,
@@ -353,7 +343,7 @@ impl Session {
         } = self;
 
         tokio::select! {
-            result = rsync.wait() => {
+            (result, report) = rsync.wait_report() => {
                 let code = match result {
                     Ok(code) => {
                         tracing::info!("rsync completed with exit code {code}");
@@ -407,11 +397,10 @@ impl Session {
                     }
                 }
 
-                if code == 0 {
-                    eprintln!("quicsync: done in {:.2}s", elapsed.as_secs_f64());
-                } else {
-                    eprintln!("quicsync: rsync exited with code {code} in {:.2}s", elapsed.as_secs_f64());
-                }
+                eprintln!(
+                    "{}",
+                    crate::ui::finish_line(code, elapsed.as_secs_f64(), "QUIC", direction, report.as_ref())
+                );
                 Ok(code)
             }
             _ = signal_rx.changed() => {
