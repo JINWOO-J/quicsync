@@ -114,7 +114,7 @@ Push mode takes multiple source paths, globs included. Pull mode takes exactly o
 | `--stats` | Print quicsync's own transfer stats | false |
 | `--stats-format text\|json` | quicsync stats output format | text |
 | `--fallback none\|rsync` | Retry over rsync-over-SSH if QUIC session init fails | none |
-| `--transport auto\|quic` | `auto` selects rsync over SSH when the RTT is below 10 ms. `quic` always uses the QUIC tunnel. | auto |
+| `--transport auto\|quic` | `auto` selects rsync over SSH when the RTT is below 10 ms. `quic` always uses the QUIC tunnel. | auto (`QUICSYNC_TRANSPORT`) |
 | `--install-remote` | Install `quicsync` on the remote if missing, then retry once | false |
 
 Anything else is passed through as an rsync option or a path. Experimental options that aren't wired into the real transfer path yet are rejected outright rather than silently accepted.
@@ -294,6 +294,7 @@ brew install gnu-time
 |----------|---------|-------------|
 | `QUICSYNC_BUFFER_SIZE` | `268435456` (256MB) | Internal buffer-layer allocation (bytes). The relay leans on bounded-channel backpressure, so reach for `--window` first when tuning. |
 | `QUICSYNC_WINDOW` | `64` | QUIC window size (MB). Raise it on high-RTT links for more throughput. |
+| `QUICSYNC_TRANSPORT` | `auto` | Default for `--transport` (`auto` or `quic`). The `--transport` option overrides it. |
 | `QUICSYNC_DEFAULT_ARGS` | unset | Default rsync options prepended to every transfer (e.g. `-a`); user-supplied options come after and take precedence. quicsync warns when no recursive flag (`-a`/`-r`/`-d`) is present, since rsync silently skips directories otherwise. |
 | `RUST_LOG` | unset | Log filter, e.g. `RUST_LOG=debug`, `RUST_LOG=quicsync=trace`. |
 

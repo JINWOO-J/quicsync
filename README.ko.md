@@ -114,7 +114,7 @@ Push 모드는 여러 소스 경로를 받는다(glob 포함). Pull 모드는 �
 | `--stats` | quicsync 자체 전송 통계 출력 | false |
 | `--stats-format text\|json` | quicsync 통계 출력 형식 | text |
 | `--fallback none\|rsync` | QUIC 세션 초기화 실패 시 rsync-over-SSH로 재시도 | none |
-| `--transport auto\|quic` | `auto`는 RTT가 10ms 미만이면 rsync over SSH로 전송, `quic`은 항상 QUIC 터널 사용 | auto |
+| `--transport auto\|quic` | `auto`는 RTT가 10ms 미만이면 rsync over SSH로 전송, `quic`은 항상 QUIC 터널 사용 | auto (`QUICSYNC_TRANSPORT`) |
 | `--install-remote` | 원격 `quicsync`가 없으면 설치 후 1회 재시도 | false |
 
 나머지 인수는 rsync 옵션이나 경로로 처리된다. 아직 실제 전송 경로에 연결되지 않은 실험 옵션은 성공한 척 무시하지 않고 그대로 거부한다.
@@ -294,6 +294,7 @@ brew install gnu-time
 |------|--------|------|
 | `QUICSYNC_BUFFER_SIZE` | `268435456` (256MB) | 내부 buffer layer 할당 크기 (바이트). relay는 주로 bounded channel backpressure에 기대므로, 성능 튜닝에는 `--window`를 먼저 쓴다 |
 | `QUICSYNC_WINDOW` | `64` | QUIC 윈도우 크기 (MB). 높은 RTT에서 올리면 처리량이 늘어난다 |
+| `QUICSYNC_TRANSPORT` | `auto` | `--transport`의 기본값(`auto` 또는 `quic`). `--transport` 옵션을 주면 그 값이 우선한다 |
 | `RUST_LOG` | unset | 로그 필터. 예: `RUST_LOG=debug`, `RUST_LOG=quicsync=trace` |
 
 ```bash

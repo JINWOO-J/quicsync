@@ -124,7 +124,7 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, CliError> {
     let mut otel_endpoint: Option<String> = None;
     let mut no_integrity = false;
     let mut fallback = FallbackMode::None;
-    let mut transport = Transport::Auto;
+    let mut transport = transport_from_env(std::env::var("QUICSYNC_TRANSPORT").ok().as_deref())?;
     let mut install_remote = false;
     let mut web = false;
     let mut remaining: Vec<&str> = Vec::new();
@@ -346,6 +346,18 @@ fn parse_fallback_mode(val: &str) -> Result<FallbackMode, CliError> {
         _ => Err(CliError::InvalidArgs(format!(
             "invalid --fallback value '{val}' (expected 'none' or 'rsync')"
         ))),
+    }
+}
+
+/// `QUICSYNC_TRANSPORT`로 기본 전송 방식을 정한다. `--transport`가 있으면 그 값이 우선한다.
+fn transport_from_env(val: Option<&str>) -> Result<Transport, CliError> {
+    match val {
+        None => Ok(Transport::Auto),
+        Some(v) => parse_transport(v).map_err(|_| {
+            CliError::InvalidArgs(format!(
+                "invalid QUICSYNC_TRANSPORT value '{v}' (expected 'auto' or 'quic')"
+            ))
+        }),
     }
 }
 
@@ -686,6 +698,24 @@ mod tests {
         let a = args(&["quicsync", "--transport=quic", "/src", "host:/dst"]);
         let cli = parse_args(&a).unwrap();
         assert_eq!(cli.transport, Transport::Quic);
+    }
+
+    #[test]
+    fn transport_from_env_defaults_to_auto() {
+        assert_eq!(transport_from_env(None).unwrap(), Transport::Auto);
+    }
+
+    #[test]
+    fn transport_from_env_reads_quic() {
+        assert_eq!(transport_from_env(Some("quic")).unwrap(), Transport::Quic);
+    }
+
+    #[test]
+    fn transport_from_env_invalid_rejected() {
+        assert!(matches!(
+            transport_from_env(Some("tcp")),
+            Err(CliError::InvalidArgs(_))
+        ));
     }
 
     #[test]
