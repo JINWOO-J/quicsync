@@ -291,23 +291,70 @@ impl RecentSpeed {
     }
 }
 
-fn progress2_text(label: &str, p: &Progress2, speed: f64, elapsed: f64) -> String {
+const BAR_MAX: usize = 30;
+// 이보다 짧으면 1칸이 4% 이상이라 막대가 진행을 거의 보여 주지 못하므로 생략한다.
+const BAR_MIN: usize = 10;
+
+fn progress_bar(percent: u8, width: usize) -> String {
+    let filled = usize::from(percent.min(100)) * width / 100;
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+// 파일 수 칸은 rsync가 목록을 만드는 동안 자릿수가 늘어나므로, 실제 길이 대신 이 폭을 떼어 두어
+// 막대 길이가 터미널 폭에만 따라 정해지게 한다. 예: "100% · 999.9 MB · 999.9 MB/s · 59:59 · files 99,999/99,999+"
+const STATS_RESERVE: usize = 59;
+
+/// 터미널 폭이 모자라면 뒤쪽 수치가 잘리므로, 수치 몫을 떼고 남은 폭만 막대에 준다.
+fn progress2_text(
+    label: &str,
+    p: &Progress2,
+    speed: f64,
+    elapsed: f64,
+    term_width: Option<usize>,
+) -> String {
+    let stats = progress2_stats(p, speed, elapsed);
+    // draw_text가 붙이는 스피너("⠹ ")와 줄 끝 여유 1칸, 막대 양옆 공백을 뺀다.
+    let used = 3 + label.chars().count() + 2 + STATS_RESERVE;
+    let bar = term_width.map_or(20, |w| w.saturating_sub(used).min(BAR_MAX));
+    if bar < BAR_MIN {
+        format!("{label} {stats}")
+    } else {
+        format!("{label} {} {stats}", progress_bar(p.percent, bar))
+    }
+}
+
+/// 각 칸을 최대 길이에 맞춰 오른쪽 정렬해 값이 바뀌어도 칸 위치가 움직이지 않게 한다.
+/// format_bytes는 최대 8자("999.9 MB"), format_speed는 최대 10자("999.9 MB/s")다.
+fn progress2_stats(p: &Progress2, speed: f64, elapsed: f64) -> String {
     let mut text = format!(
-        "{label} {}% · {} · {} · {}",
-        p.percent,
+        "{:>4} · {:>8} · {:>10} · {:>5}",
+        // 목록이 완성되기 전 퍼센트는 실제보다 높게 나오므로 추정치로 표시한다.
+        format!("{}{}%", if p.scanning { "~" } else { "" }, p.percent),
         crate::progress::format_bytes(p.bytes),
         crate::progress::format_speed(speed),
-        crate::progress::format_eta(elapsed)
+        format_clock(elapsed)
     );
     if let (Some(done), Some(total)) = (p.files_done, p.files_total) {
         let more = if p.scanning { "+" } else { "" };
+        let total = crate::ui::group_digits(total);
         text.push_str(&format!(
-            " · 파일 {}/{}{more}",
+            " · files {:>w$}/{total}{more}",
             crate::ui::group_digits(done),
-            crate::ui::group_digits(total)
+            w = total.len()
         ));
     }
     text
+}
+
+/// `m:ss`, 1시간부터 `h:mm:ss`. 1시간 전까지 길이가 바뀌지 않는다.
+fn format_clock(secs: f64) -> String {
+    let s = secs as u64;
+    let (h, m, s) = (s / 3600, s % 3600 / 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 /// rsync stdout을 읽어 progress2는 진행 줄로 그리고, `--stats` 블록은 요약용으로 읽는다.
@@ -329,6 +376,7 @@ async fn relay_rsync_output(
     let mut in_stats = false;
     let mut blank_lines = 0usize;
     let mut last_draw: Option<std::time::Instant> = None;
+    let mut shown_percent = 0u8;
     let mut pending = Vec::new();
     let mut buf = [0u8; 8192];
     let write_out = |bytes: &[u8]| {
@@ -347,12 +395,21 @@ async fn relay_rsync_output(
             let segment: Vec<u8> = pending.drain(..=pos).collect();
             let text = String::from_utf8_lossy(&segment[..segment.len() - 1]).to_string();
             let trimmed = text.trim();
-            if let Some(p) = parse_progress2(&text) {
+            if let Some(mut p) = parse_progress2(&text) {
+                // 파일 목록을 만드는 동안 rsync는 지금까지 찾은 크기로 퍼센트를 계산해 값이 뒤로 갈 수 있다.
+                shown_percent = shown_percent.max(p.percent);
+                p.percent = shown_percent;
                 let now = std::time::Instant::now();
                 let current = speed.push(now, p.bytes);
                 if last_draw.is_none_or(|t| now.duration_since(t).as_millis() >= 250) {
                     let elapsed = started.elapsed().as_secs_f64();
-                    line.draw_text(&progress2_text(label, &p, current, elapsed));
+                    line.draw_text(&progress2_text(
+                        label,
+                        &p,
+                        current,
+                        elapsed,
+                        crate::ui::terminal_width(),
+                    ));
                     last_draw = Some(now);
                 }
                 continue;
@@ -584,6 +641,76 @@ mod tests {
         assert!(scanning.scanning);
         assert_eq!(parse_progress2("Number of files: 48,912"), None);
         assert_eq!(parse_progress2("sent 1,513,918 bytes  received 4,239 bytes"), None);
+    }
+
+    #[test]
+    fn progress_bar_fills_by_percent() {
+        assert_eq!(progress_bar(0, 10), "░░░░░░░░░░");
+        assert_eq!(progress_bar(54, 10), "█████░░░░░");
+        assert_eq!(progress_bar(99, 10), "█████████░");
+        assert_eq!(progress_bar(100, 10), "██████████");
+    }
+
+    #[test]
+    fn progress2_text_fits_bar_to_terminal_width() {
+        let p =
+            parse_progress2("    373,031,424  54%   88.30MB/s    0:00:04 (xfr#120, to-chk=30/100)")
+                .unwrap();
+        let wide = progress2_text("QUIC", &p, 1e6, 8.0, Some(200));
+        assert!(wide.contains(&"█".repeat(16)), "{wide}");
+        assert_eq!(
+            wide.chars().filter(|&c| c == '█' || c == '░').count(),
+            BAR_MAX
+        );
+        for w in [60, 80, 100] {
+            let text = progress2_text("QUIC", &p, 1e6, 8.0, Some(w));
+            assert!(text.chars().count() + 3 <= w, "{w}: {text}");
+        }
+        let narrow = progress2_text("QUIC", &p, 1e6, 8.0, Some(50));
+        assert!(!narrow.contains('░'), "{narrow}");
+    }
+
+    #[test]
+    fn format_clock_uses_fixed_width_under_an_hour() {
+        assert_eq!(format_clock(4.9), "0:04");
+        assert_eq!(format_clock(65.0), "1:05");
+        assert_eq!(format_clock(3723.0), "1:02:03");
+    }
+
+    #[test]
+    fn progress2_stats_keeps_field_positions() {
+        let early =
+            parse_progress2("  44,040,192   7%    1.00MB/s    0:00:00 (xfr#23, to-chk=278/301)")
+                .unwrap();
+        let late =
+            parse_progress2("  416,022,528  69%    1.00MB/s    0:00:02 (xfr#209, to-chk=92/301)")
+                .unwrap();
+        let a = progress2_stats(&early, 145e6, 0.3);
+        let b = progress2_stats(&late, 150.2e6, 2.0);
+        assert_eq!(a.chars().count(), b.chars().count(), "\n{a}\n{b}");
+        assert!(a.ends_with("files  23/301"), "{a}");
+    }
+
+    #[test]
+    fn progress2_stats_marks_percent_as_estimate_while_scanning() {
+        let p =
+            parse_progress2("  8,000,000  25%    1.00MB/s    0:00:00 (xfr#1, ir-chk=1001/1133)")
+                .unwrap();
+        assert!(progress2_stats(&p, 1e6, 1.0).starts_with("~25% ·"));
+    }
+
+    #[test]
+    fn progress2_text_keeps_bar_width_as_stats_change() {
+        let bar_len = |t: String| t.chars().filter(|&c| c == '█' || c == '░').count();
+        let early =
+            parse_progress2("  1,024   0%    1.00kB/s    0:00:00 (xfr#1, ir-chk=10/12)").unwrap();
+        let late = parse_progress2(
+            "  1,234,567,890  87%   88.30MB/s    0:01:04 (xfr#45,503, to-chk=3,409/48,912)",
+        )
+        .unwrap();
+        let a = progress2_text("QUIC", &early, 900.0, 0.5, Some(100));
+        let b = progress2_text("QUIC", &late, 123e6, 64.0, Some(100));
+        assert_eq!(bar_len(a), bar_len(b));
     }
 
     #[test]

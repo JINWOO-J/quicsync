@@ -96,11 +96,11 @@ quicsync --fallback=rsync /src user@host:/dst
 ```text
 quicsync 0.6.1 · push ~/work/app → user@host:/dst
 route: QUIC (RTT 12.3ms)
-⠹ QUIC 54% · 829.1 MB · 129.5 MB/s · 8s · 파일 3,319/4,344+
+⠹ QUIC ████████████████░░░░░░░░░░░░░░ ~54% · 829.1 MB · 129.5 MB/s ·  0:08 · files 3,319/4,344+
 ✓ done · 17.9s · 45,503 files · 2.3 GB (1.1 GB on the wire, 2.2x compressed) · avg 59.9 MB/s · QUIC
 ```
 
-진행 줄은 rsync의 `--info=progress2`를 읽으므로 로컬 rsync가 3.1 이상이어야 한다. 전송량은 압축 전 파일 크기 기준이고, 파일 수 뒤의 `+`는 rsync가 아직 파일 목록을 만드는 중이라는 뜻이다.
+진행 줄은 rsync의 `--info=progress2`를 읽으므로 로컬 rsync가 3.1 이상이어야 한다. 전송량은 압축 전 파일 크기 기준이고, 파일 수 뒤의 `+`는 rsync가 아직 파일 목록을 만드는 중이라는 뜻이다. 이 동안 rsync는 지금까지 찾은 파일만으로 퍼센트를 계산하므로, quicsync는 퍼센트 앞에 `~`를 붙이고 값이 뒤로 가지 않게 표시한다.
 
 출력이 터미널이 아니거나 `--no-progress`를 주면 예전처럼 rsync의 `--stats` 요약 전체가 나온다. `-v`를 줘도 전체 요약이 나오고, `-P`, `--progress`, `--info=...`를 주면 rsync 자체 진행 출력을 그대로 보인다. quicsync 자체 전송 통계는 `--stats`로 본다. `NO_COLOR`를 설정하면 색을 쓰지 않는다.
 

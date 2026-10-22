@@ -96,11 +96,11 @@ quicsync prints the direction, the paths, and the selected transport at the star
 ```text
 quicsync 0.6.1 · push ~/work/app → user@host:/dst
 route: QUIC (RTT 12.3ms)
-⠹ QUIC 54% · 829.1 MB · 129.5 MB/s · 8s · 파일 3,319/4,344+
+⠹ QUIC ████████████████░░░░░░░░░░░░░░ ~54% · 829.1 MB · 129.5 MB/s ·  0:08 · files 3,319/4,344+
 ✓ done · 17.9s · 45,503 files · 2.3 GB (1.1 GB on the wire, 2.2x compressed) · avg 59.9 MB/s · QUIC
 ```
 
-The progress line uses rsync `--info=progress2` and needs rsync 3.1 or later on the local host. The byte count is the file size before compression. The `+` after the file total means that rsync still builds the file list.
+The progress line uses rsync `--info=progress2` and needs rsync 3.1 or later on the local host. The byte count is the file size before compression. The `+` after the file total means that rsync still builds the file list. During that time, rsync calculates the percentage from the files that it found so far. quicsync marks this percentage with `~` and does not let it go back.
 
 If the output is not a terminal, or if you pass `--no-progress`, rsync prints its full `--stats` summary as before. If you pass `-v`, rsync also prints the full summary. If you pass `-P`, `--progress`, or `--info=...`, rsync prints its own progress output. Pass `--stats` for the quicsync transfer statistics. `NO_COLOR` turns off colors.
 
