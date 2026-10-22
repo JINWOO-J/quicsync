@@ -137,7 +137,7 @@ dist: release-all
 		if [ -f "$$src" ]; then \
 			tmp=$$(mktemp -d); \
 			cp "$$src" "$$tmp/quicsync"; \
-			tar -C "$$tmp" -czf "$(DIST_DIR)/$$asset" quicsync; \
+			COPYFILE_DISABLE=1 tar --no-xattrs -C "$$tmp" -czf "$(DIST_DIR)/$$asset" quicsync; \
 			rm -rf "$$tmp"; \
 			echo "Packaged $$asset"; \
 		fi; \
