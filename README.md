@@ -95,9 +95,9 @@ quicsync prints the direction, the paths, and the selected transport at the star
 
 ```text
 quicsync 0.6.1 · push ~/work/app → user@host:/dst
-경로: QUIC (RTT 12.3ms)
+route: QUIC (RTT 12.3ms)
 ⠹ QUIC 54% · 829.1 MB · 129.5 MB/s · 8s · 파일 3,319/4,344+
-✓ 완료 · 17.9s · 파일 45,503개 · 2.3 GB (전송 1.1 GB, 압축 2.2배) · 평균 59.9 MB/s · QUIC
+✓ done · 17.9s · 45,503 files · 2.3 GB (1.1 GB on the wire, 2.2x compressed) · avg 59.9 MB/s · QUIC
 ```
 
 The progress line uses rsync `--info=progress2` and needs rsync 3.1 or later on the local host. The byte count is the file size before compression. The `+` after the file total means that rsync still builds the file list.
@@ -141,8 +141,7 @@ At low RTT, plain rsync over SSH can be faster than the QUIC tunnel. With the de
 When quicsync selects rsync over SSH, it prints this notice to stderr:
 
 ```text
-quicsync: RTT가 0.4ms로 10ms보다 낮아 rsync over SSH로 전송합니다.
-          손실이 있는 회선이면 QUIC이 더 빠를 수 있습니다: --transport=quic
+route: rsync over SSH (RTT 0.4ms < 10ms · use --transport=quic on lossy links)
 ```
 
 quicsync always uses the QUIC tunnel in these cases:

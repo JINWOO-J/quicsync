@@ -335,7 +335,7 @@ async fn run_client(raw_args: &[String]) -> ExitCode {
     // 순정 rsync 경로는 정상 종료 시 rsync stderr를 보여 주지 않으므로 경로를 고르기 전에 출력한다.
     if !quicsync::rsync::has_recursive_flag(&args.rsync_options) {
         quicsync::ui::warn(
-            "재귀 옵션(-a, -r 등)이 없어 디렉토리는 복사되지 않습니다. -a를 추가하거나 QUICSYNC_DEFAULT_ARGS=-a를 설정하세요.",
+            "no recursive option (-a, -r, ...): directories will be skipped. Add -a or set QUICSYNC_DEFAULT_ARGS=-a.",
         );
     }
 
@@ -353,7 +353,7 @@ async fn run_client(raw_args: &[String]) -> ExitCode {
         Err(e) => {
             quicsync::ui::error(&e.to_string());
             if fallback == FallbackMode::Rsync {
-                quicsync::ui::route("rsync over SSH (QUIC 초기화 실패, --fallback=rsync)");
+                quicsync::ui::route("rsync over SSH (QUIC setup failed, --fallback=rsync)");
                 return run_rsync_fallback(fallback_args).await;
             }
             return ExitCode::FAILURE;
@@ -373,17 +373,17 @@ async fn run_client(raw_args: &[String]) -> ExitCode {
 /// RTT가 낮으면 rsync over SSH가 더 빠를 수 있다. --web, --stats는 QUIC 경로에만 있는 기능이라 요청되면 전환하지 않는다.
 async fn choose_route(args: &quicsync::types::CliArgs) -> (bool, String) {
     if args.transport != Transport::Auto {
-        return (false, "QUIC (지정됨)".to_string());
+        return (false, "QUIC (transport=quic)".to_string());
     }
     if args.web || args.stats {
-        return (false, "QUIC (--web·--stats는 QUIC에서만 동작)".to_string());
+        return (false, "QUIC (--web and --stats need QUIC)".to_string());
     }
     let limit_ms = AUTO_RSYNC_MAX_RTT.as_millis();
     match probe_ssh_rtt(&args.remote.host, AUTO_RSYNC_MAX_RTT).await {
         Some(rtt) if rtt < AUTO_RSYNC_MAX_RTT => (
             true,
             format!(
-                "rsync over SSH (RTT {:.1}ms < {limit_ms}ms · 손실이 있는 회선이면 --transport=quic)",
+                "rsync over SSH (RTT {:.1}ms < {limit_ms}ms · use --transport=quic on lossy links)",
                 rtt.as_secs_f64() * 1000.0
             ),
         ),
@@ -391,10 +391,7 @@ async fn choose_route(args: &quicsync::types::CliArgs) -> (bool, String) {
             false,
             format!("QUIC (RTT {:.1}ms)", rtt.as_secs_f64() * 1000.0),
         ),
-        None => (
-            false,
-            format!("QUIC (RTT {limit_ms}ms 이상 또는 측정 불가)"),
-        ),
+        None => (false, format!("QUIC (RTT >= {limit_ms}ms or not measured)")),
     }
 }
 

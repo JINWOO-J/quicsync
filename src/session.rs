@@ -92,7 +92,7 @@ impl Session {
         let handshake = match ssh_result {
             Ok(handshake) => handshake,
             Err(SshError::BinaryNotFound(e)) if args.install_remote => {
-                crate::ui::info("원격에 quicsync가 없어 같은 버전을 설치합니다");
+                crate::ui::info("quicsync not found on remote, installing the local version");
                 let version = RemoteInstaller::install_smart(&args.remote, "$HOME/.local/bin")
                     .await
                     .map_err(|install_err| {
@@ -100,7 +100,7 @@ impl Session {
                             "remote install failed after binary-not-found ({e}): {install_err}"
                         ))
                     })?;
-                crate::ui::info(&format!("원격 설치 완료: {version}"));
+                crate::ui::info(&format!("remote install done: {version}"));
                 launch_remote_server(&args.remote)
                     .await
                     .map_err(|retry_err| SessionError::InitFailed(format!("SSH: {retry_err}")))?
@@ -115,7 +115,7 @@ impl Session {
                 None => args.remote.host.clone(),
             };
             crate::ui::warn(&format!(
-                "원격 quicsync 버전({})이 로컬({local_version})과 달라 전송이 실패할 수 있습니다. 맞추려면: quicsync install-remote {target}",
+                "remote quicsync {} differs from local {local_version}, the transfer can fail. To match: quicsync install-remote {target}",
                 handshake.remote_version
             ));
         }
@@ -254,7 +254,7 @@ impl Session {
             match crate::web::bind().await {
                 Ok((listener, addr)) => {
                     let url = format!("http://{addr}");
-                    crate::ui::info(&format!("웹 모니터: {url}"));
+                    crate::ui::info(&format!("web monitor: {url}"));
                     open_browser(&url);
                     let web_metrics = metrics.clone();
                     web_tasks.push(tokio::spawn(async move {
@@ -262,9 +262,7 @@ impl Session {
                     }));
                 }
                 Err(e) => {
-                    crate::ui::warn(&format!(
-                        "웹 모니터를 띄우지 못했습니다(포트 바인딩 실패: {e})"
-                    ));
+                    crate::ui::warn(&format!("web monitor not started (port bind failed: {e})"));
                 }
             }
 

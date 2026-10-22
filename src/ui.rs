@@ -30,7 +30,7 @@ fn display_local(paths: &[PathBuf]) -> String {
     };
     match paths {
         [one] => shorten(one),
-        _ => format!("{}개 경로", paths.len()),
+        _ => format!("{} paths", paths.len()),
     }
 }
 
@@ -56,7 +56,7 @@ pub fn header(direction: TransferDirection, local_paths: &[PathBuf], remote: &Re
 }
 
 pub fn route(text: &str) {
-    eprintln!("{} {text}", paint("2", "경로:"));
+    eprintln!("{} {text}", paint("2", "route:"));
 }
 
 pub fn info(text: &str) {
@@ -64,11 +64,11 @@ pub fn info(text: &str) {
 }
 
 pub fn warn(text: &str) {
-    eprintln!("{} {text}", paint("33", "⚠ 경고:"));
+    eprintln!("{} {text}", paint("33", "⚠ warning:"));
 }
 
 pub fn error(text: &str) {
-    eprintln!("{} {text}", paint("31", "✗ 오류:"));
+    eprintln!("{} {text}", paint("31", "✗ error:"));
 }
 
 /// rsync `--stats`에서 읽은 전송 결과. 읽지 못한 항목은 None이다.
@@ -80,7 +80,7 @@ pub struct RsyncReport {
     pub bytes_received: Option<u64>,
 }
 
-/// 완료 줄: `✓ 완료 · 21.9s · 파일 45,503개 · 2.3 GB (전송 1.1 GB, 압축 2.2배) · 평균 49.0 MB/s · QUIC`
+/// 완료 줄: `✓ done · 21.9s · 45,503 files · 2.3 GB (1.1 GB on the wire, 2.2x compressed) · avg 49.0 MB/s · QUIC`
 pub fn finish_line(
     code: i32,
     elapsed_secs: f64,
@@ -91,19 +91,20 @@ pub fn finish_line(
     let elapsed = format!("{elapsed_secs:.1}s");
     if code != 0 {
         return format!(
-            "{} · rsync 종료 코드 {code} · {elapsed} · {transport}",
-            paint("31", "✗ 실패")
+            "{} · rsync exit code {code} · {elapsed} · {transport}",
+            paint("31", "✗ failed")
         );
     }
-    let ok = paint("32", "✓ 완료");
+    let ok = paint("32", "✓ done");
     let Some(r) = report else {
         return format!("{ok} · {elapsed} · {transport}");
     };
     let mut parts = vec![ok, elapsed];
     if r.files_transferred == Some(0) {
-        parts.push("변경 없음".to_string());
+        parts.push("no changes".to_string());
     } else if let Some(n) = r.files_transferred {
-        parts.push(format!("파일 {}개", group_digits(n)));
+        let unit = if n == 1 { "file" } else { "files" };
+        parts.push(format!("{} {unit}", group_digits(n)));
     }
     let wire = match direction {
         TransferDirection::Push => r.bytes_sent,
@@ -116,7 +117,7 @@ pub fn finish_line(
         // 압축이 거의 없으면 비율을 생략해 줄을 짧게 유지한다.
         if ratio >= 1.05 {
             parts.push(format!(
-                "{} (전송 {}, 압축 {ratio:.1}배)",
+                "{} ({} on the wire, {ratio:.1}x compressed)",
                 crate::progress::format_bytes(size),
                 crate::progress::format_bytes(wire)
             ));
@@ -124,7 +125,7 @@ pub fn finish_line(
             parts.push(crate::progress::format_bytes(size));
         }
         parts.push(format!(
-            "평균 {}",
+            "avg {}",
             crate::progress::format_speed(wire as f64 / elapsed_secs.max(0.001))
         ));
     }
@@ -179,8 +180,11 @@ mod tests {
     fn finish_line_summarizes_push() {
         let line = finish_line(0, 21.9, "QUIC", TransferDirection::Push, Some(&report()));
         assert!(line.contains("21.9s"), "{line}");
-        assert!(line.contains("파일 45,503개"), "{line}");
-        assert!(line.contains("2.3 GB (전송 1.1 GB, 압축 2.2배)"), "{line}");
+        assert!(line.contains("45,503 files"), "{line}");
+        assert!(
+            line.contains("2.3 GB (1.1 GB on the wire, 2.2x compressed)"),
+            "{line}"
+        );
         assert!(line.ends_with("QUIC"), "{line}");
     }
 
@@ -193,13 +197,23 @@ mod tests {
             bytes_received: Some(4_239),
         };
         let line = finish_line(0, 0.8, "QUIC", TransferDirection::Push, Some(&r));
-        assert!(line.contains("변경 없음"), "{line}");
-        assert!(!line.contains("평균"), "{line}");
+        assert!(line.contains("no changes"), "{line}");
+        assert!(!line.contains("avg"), "{line}");
+    }
+
+    #[test]
+    fn finish_line_uses_singular_for_one_file() {
+        let r = RsyncReport {
+            files_transferred: Some(1),
+            ..report()
+        };
+        let line = finish_line(0, 1.1, "QUIC", TransferDirection::Push, Some(&r));
+        assert!(line.contains(" 1 file "), "{line}");
     }
 
     #[test]
     fn finish_line_reports_failure_code() {
         let line = finish_line(12, 0.6, "QUIC", TransferDirection::Pull, None);
-        assert!(line.contains("rsync 종료 코드 12"), "{line}");
+        assert!(line.contains("rsync exit code 12"), "{line}");
     }
 }
